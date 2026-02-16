@@ -32,6 +32,8 @@ def main():
                         help="Minimum combos per (mult, buy_mult) cell")
     parser.add_argument("--top-plateaus", type=int, default=10,
                         help="Max number of plateaus to generate ranges for")
+    parser.add_argument("--symbol2", default=None,
+                        help="Secondary symbol for DualS strategies")
     parser.add_argument("--config", default="config.yaml",
                         help="Config file path")
     args = parser.parse_args()
@@ -43,6 +45,13 @@ def main():
 
     symbol = args.symbol
     results_dir = cfg.get("results_dir", "results")
+
+    # Resolve symbol2 for DualS folder naming (matches TS convention)
+    from wfo.runner import _is_dual_symbol
+    symbol2 = None
+    if _is_dual_symbol(args.strategy):
+        symbol2 = args.symbol2 or cfg.get("symbol2")
+    symbol_key = f"{symbol}_{symbol2}" if symbol2 else symbol
     range_dir = cfg.get("ranges", {}).get("default_range_dir", "strategies/ranges")
 
     # Map strategy kernel names to TS strategy names
@@ -58,7 +67,7 @@ def main():
 
     # Load candidates
     candidates_path = args.candidates or os.path.join(
-        results_dir, symbol, f"candidates_{args.strategy}_phase1_slim.csv")
+        results_dir, symbol_key, f"candidates_{args.strategy}_phase1_slim.csv")
     if not os.path.exists(candidates_path):
         print(f"ERROR: Candidates file not found: {candidates_path}")
         sys.exit(1)
@@ -85,7 +94,7 @@ def main():
         sys.exit(1)
 
     # Generate range files
-    output_dir = os.path.join(results_dir, symbol)
+    output_dir = os.path.join(results_dir, symbol_key)
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*60}")

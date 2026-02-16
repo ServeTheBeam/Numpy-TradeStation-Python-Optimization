@@ -21,6 +21,8 @@ from analysis.refinement_analyzer import (
 def main():
     parser = argparse.ArgumentParser(description="Analyze TS refinement results")
     parser.add_argument("--symbol", default="SMH", help="Symbol name")
+    parser.add_argument("--symbol2", default=None,
+                        help="Secondary symbol for DualS strategies")
     parser.add_argument("--top", type=int, default=25,
                         help="Number of top results to show")
     parser.add_argument("--config", default="config.yaml",
@@ -33,7 +35,9 @@ def main():
             cfg = yaml.safe_load(f) or {}
 
     results_dir = cfg.get("results_dir", "results")
-    symbol_folder = os.path.join(results_dir, args.symbol)
+    # Use SYMBOL_SYMBOL2 folder for DualS (matches TS convention)
+    symbol_key = f"{args.symbol}_{args.symbol2}" if args.symbol2 else args.symbol
+    symbol_folder = os.path.join(results_dir, symbol_key)
 
     if not os.path.exists(symbol_folder):
         print(f"ERROR: Symbol folder not found: {symbol_folder}")
@@ -47,7 +51,7 @@ def main():
         sys.exit(1)
 
     analyses = generate_report(results, symbol_folder, args.top)
-    save_combined_excel(analyses, symbol_folder, args.symbol)
+    save_combined_excel(analyses, symbol_folder, symbol_key)
 
     print(f"\nAnalysis complete. {len(analyses)} plateaus analyzed.")
     print("Scoring: MAR>0.5 good, Sharpe>1.0 good, PF>1.5 good")

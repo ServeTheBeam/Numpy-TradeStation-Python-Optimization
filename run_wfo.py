@@ -83,6 +83,17 @@ def main():
     data_dir = cfg.get("data_dir", "data/parquet")
     results_dir = cfg.get("results_dir", "results")
 
+    # Resolve symbol2 early so folder name matches TS convention (TQQQ_QQQ)
+    from wfo.runner import _is_dual_symbol
+    symbol2 = None
+    if _is_dual_symbol(strategy):
+        symbol2 = args.symbol2 or cfg.get("symbol2")
+        if not symbol2:
+            print("ERROR: DualS strategies require --symbol2 "
+                  "or symbol2 in config.yaml")
+            sys.exit(1)
+    symbol_key = f"{symbol}_{symbol2}" if symbol2 else symbol
+
     # Import grid module dynamically based on strategy
     import importlib
     grid_mod = importlib.import_module(f"grids.{strategy}")
@@ -97,7 +108,7 @@ def main():
         print(f"  {name:>22}: {len(vals):>3} values  [{vals[0]:.2f} ... {vals[-1]:.2f}]")
     print(f"  {'TOTAL':>22}: {total:>12,} combinations")
 
-    output_dir = args.wfo_dir or os.path.join(results_dir, symbol, "wfo")
+    output_dir = args.wfo_dir or os.path.join(results_dir, symbol_key, "wfo")
 
     if args.rescore:
         # Re-score cached results
@@ -110,14 +121,8 @@ def main():
         print(f"Transaction cost: ${cost:.4f}/share round-trip")
 
         # Load Data2 for DualS strategies
-        from wfo.runner import _is_dual_symbol
         highs2 = lows2 = closes2 = None
-        if _is_dual_symbol(strategy):
-            symbol2 = args.symbol2 or cfg.get("symbol2")
-            if not symbol2:
-                print("ERROR: DualS strategies require --symbol2 "
-                      "or symbol2 in config.yaml")
-                sys.exit(1)
+        if symbol2:
             h2, l2, c2, _ = load_data(symbol2, data_dir, args.start)
             highs2, lows2, closes2 = h2, l2, c2
 
@@ -147,14 +152,14 @@ def main():
 
     # Save
     output = args.output or os.path.join(
-        results_dir, symbol, f"candidates_{strategy}_{grid_name}.csv")
+        results_dir, symbol_key, f"candidates_{strategy}_{grid_name}.csv")
     os.makedirs(os.path.dirname(output), exist_ok=True)
     results.to_csv(output, index=False)
     print(f"\nSaved {len(results):,} stable combos to {output}")
 
     # Chain into plateau detection (default)
     if not args.no_plateaus:
-        run_plateaus(results, strategy, symbol, cfg, results_dir, min_phases)
+        run_plateaus(results, strategy, symbol_key, cfg, results_dir, min_phases)
 
 
 def run_plateaus(candidates, strategy, symbol, cfg, results_dir, min_phases):
