@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.npy
+*.bin
+*.egg-info/
+dist/
+build/
+.eggs/
+*.parquet
+data/parquet/
+results/
+*.xlsx
+.venv/
+.env

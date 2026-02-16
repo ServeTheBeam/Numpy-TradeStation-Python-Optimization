@@ -1,0 +1,1064 @@
+{-------------------------------------------------------------
+ Strategy: Buy & Hold with ATR Trailing Stop - BiDirectional Dual Symbol
+ Version: 1.5-BiDirectional-DualSymbol (Cap-on-Entry + Entry Ratchet - Hybrid Model)
+ Date: 2026-01-08
+ Platform: TradeStation EasyLanguage
+ Timeframe: Daily bars (same timeframe, different symbols)
+
+ Description: BIDIRECTIONAL buy-and-hold strategy that analyzes an
+              index ETF (Data2) for volatility signals but trades
+              a leveraged version (Data1). Uses HYBRID MODEL for
+              optimal signal stability and correct price scaling.
+              Supports configurable entry flip behavior.
+
+ Dual Symbol Setup (HYBRID MODEL):
+ - Data1 = Leveraged ETF (execution) - e.g., TQQQ, UPRO, SOXL
+ - Data2 = Index ETF (analysis) - e.g., QQQ, SPY, SOXX
+ - Same timeframe (daily bars)
+
+ Hybrid Calculation Distribution:
+ - Entry signals (ATR, Buy/SellTouchLevel): Data1 (correct price scale)
+ - Stop tightening (BB Width): Data2 (stable volatility signal)
+ - Stop calculations (ATR, HL2): Data1 (actual traded instrument)
+ - All trades executed on Data1
+
+ Key Features:
+ - BIDIRECTIONAL (long and short positions)
+ - Configurable entry modes (flat only, long priority, full bidir)
+ - ATR trailing stop (server-side via SetDollarTrailing)
+ - BB tightening: Contracts stop during low volatility (from Data2)
+ - Multiple scaling methods: Linear, Square Root, Exponential
+ - Floating Entry: BuyTouchLevel = Close(Data1) + (ATR_EMA(Data1) × Multiplier)
+ - Floating Entry: SellTouchLevel = Close(Data1) - (ATR_EMA(Data1) × Multiplier)
+ - EMA smoothing reduces ATR whipsaws while staying responsive
+ - Entry levels recalculated every bar when flat
+
+ Entry Modes (Configurable via Entry_Mode input):
+
+ MODE 0 - Symmetric (Flat Only):
+ - Long:  Can enter ONLY from flat
+ - Short: Can enter ONLY from flat
+ - Both directions require position exit before new entry
+ - Most conservative, avoids flip whipsaws
+ - Best for: Choppy markets, risk-averse traders
+
+ MODE 1 - Long Priority (Default):
+ - Long:  Can enter from flat OR flip from short immediately
+ - Short: Can enter ONLY from flat (never flip from long)
+ - Asymmetric bias favoring upside
+ - Long signals have priority
+ - Best for: Bull markets, leveraged long ETFs (TQQQ, UPRO)
+ - Rationale: Markets trend up long-term, leveraged ETF upward bias
+
+ MODE 2 - Full Bidirectional:
+ - Long:  Can enter from flat OR flip from short immediately
+ - Short: Can enter from flat OR flip from long immediately
+ - Symmetric aggressive flipping
+ - Both directions treated equally
+ - Best for: Range-bound markets, mean reversion strategies
+ - Warning: Higher whipsaw risk, more transaction costs
+
+ Trend Veto Filter for Flat Entry:
+ When BOTH long and short are possible (flat position, both directions allowed):
+ - Uses Trend_Filter_Period EMA slope as a VETO, not a choice
+ - DEFAULT: Place LONG order (bull market bias for leveraged ETFs)
+ - VETO: Only allow SHORT if slope < -Trend_Veto_Threshold (strong downtrend)
+ - Threshold prevents daily noise from triggering shorts
+
+ Logic:
+ - Slope >= -Threshold: Place LONG (default, filters out weak downtrends)
+ - Slope < -Threshold: Place SHORT (only on strong downtrends)
+
+ Benefits:
+ - Bull market bias (long is default choice)
+ - Shorts only during significant downtrends (not daily noise)
+ - Prevents 50/50 long/short split in bull markets
+ - Reduces whipsaws from minor slope changes
+ - Lower transaction costs (fewer direction changes)
+
+ Both_Triggered_Mode (Tiebreaker when Trend_Slope = 0):
+ MODE 0 - Long Priority (Default):
+ - Place LONG order when trend is perfectly flat
+ - Favors upside in ambiguous situations
+ - Best for: Leveraged long ETFs with bullish bias
+
+ MODE 1 - Skip Both:
+ - Skip BOTH orders when trend is perfectly flat
+ - Waits for trend to establish clear direction
+ - Best for: Avoiding whipsaws, requiring clean signals
+
+ Entry Signals:
+ - Long: Buy-If-Touched above floating level (calculated from Data1)
+ - Short: Sell-If-Touched below floating level (calculated from Data1)
+ - BuyTouchLevel = Close(Data1) + (ATR_EMA(Data1) × ATRBuyMultiplier)
+ - SellTouchLevel = Close(Data1) - (ATR_EMA(Data1) × ATRBuyMultiplier)
+ - Entry uses Data1's own volatility (correct price scale)
+ - Recalculated every bar when flat (follows Data1 price)
+
+ Exit Signals:
+ - ATR trailing stop hit (calculated from Data1, tightened by Data2 BB)
+ - Stop tightening uses Data2 BB Width (cleaner volatility signal)
+ - NO OTHER EXIT CONDITIONS (always in market or waiting for re-entry)
+
+ Position Sizing:
+ - P/L reinvestment based on cumulative performance
+ - Shares calculated using Data1 close price (leveraged ETF)
+
+ Why Hybrid Model:
+ - Entry on Data1: No price scale conversion needed
+ - Tightening from Data2: Filters leveraged ETF noise
+ - Best of both: Correct scaling + stable signals
+--------------------------------------------------------------}
+
+Inputs:
+	Name("Your strategy name")	  [DisplayName = "Displays in Strategy Name Column for ID"],
+    InitialInvestment(10000)      [DisplayName = "Initial Capital ($)"],
+    RunLive(false)                [DisplayName = "Run Live Mode (Baseline P/L)"],
+
+    // ATR Trailing Stop Parameters
+    ATR_Period(14)                [DisplayName = "[4-70][1] ATR Period (Stop Loss)"],
+    ATR_Multiplier(2.0)           [DisplayName = "[1-30][.25] ATR Multiplier (Stop Distance)"],
+    Short_Multiplier(1.0)         [DisplayName = "[.2-1][.1] Short Exit Multiplier"],
+
+    // Bollinger Band Tightening Parameters
+    BB_Length(20)                 [DisplayName = "[6-70][2] BB Length (Volatility)"],
+    BB_Deviation(2.0)             [DisplayName = "[1-4][.25] BB Std Deviations"],
+    Vol_Threshold(0.10)           [DisplayName = "[.02-.4][.02] BB Width Threshold (Tightening)"],
+    Min_Tightening(0.10)          [DisplayName = "[.1-.95][.05] Min Tightening Multiplier"],
+
+    // Scaling Method for BB Tightening
+    Scaling_Method(0)             [DisplayName = "[0-2][1] BB Scaling Method (0=Lin,1=Sqrt,2=Exp)"],
+
+    // Re-Entry Parameters (Floating with EMA Smoothed ATR)
+    ATRBuy_Period(14)             [DisplayName = "[4-70][1] ATR Period (Entry)"],
+    ATRBuyMultiplier(2.0)         [DisplayName = "[.5-20][.25] ATR Multiplier (Entry Buffer)"],
+    ATR_Smooth_Period(5)          [DisplayName = "[1-20][1] ATR EMA Smoothing Period"],
+    // Entry_Ratchet hardcoded to 0 (Float mode) - removed from optimization grid
+    // Analysis showed Entry_Ratchet=0 consistently outperformed in all v1.5 optimizations
+    // while doubling grid size (100% increase). Keeping code for manual testing if needed.
+    Entry_Ratchet(0)              [DisplayName = "Entry Ratchet (HARDCODED=0, not optimized)"],
+
+    // Entry Flip Behavior
+    Entry_Mode(1)                 [DisplayName = "[0-2][1] Entry Mode (0=Flat,1=LongPri,2=FullBiDir)"],
+
+    // Trend Filter for Flat Entry (when both long and short are possible)
+    Trend_Filter_Period(5)        [DisplayName = "[3-20][1] Trend Filter Period (Flat Entry)"],
+    Trend_Veto_Threshold(0.05)    [DisplayName = "[0-.5][.01] Trend Slope Veto Threshold"],
+
+    // Dual Entry Resolution (when both long and short could trigger when flat)
+    Both_Triggered_Mode(0)        [DisplayName = "[0-1][1] Both Trigger Mode (0=LongPri,1=Skip)"],
+
+    // Price Selection for BB Calculations (Data2)
+    EquityPrice_Method(0)         [DisplayName = "[0-1][1] Price Method (0=TypicalPrice,1=Close)"],
+
+    // Trading Options
+    EnableLongTrades(true)        [DisplayName = "Enable Long Positions"],
+    EnableShortTrades(true)       [DisplayName = "Enable Short Positions"],
+
+    PrintTesting(false)           [DisplayName = "Enable Debug Output"];
+
+Variables:
+    // Price Calculation
+    CurrentPrice(0),
+    HL2(0),
+
+    // ATR and Stop Management
+    ATR_Value(0),
+    ATR_Period_Short(0),
+    ATR_Value_Short(0),
+    BasicStop(0),
+    FinalStop_Long(0),
+    FinalStop_Short(0),
+    StopDistance(0),
+    TrailAmtPerShare(0),
+
+    // Bollinger Band Volatility
+    BB_Width(0),
+    BB_Multiplier(1.0),
+
+    // Opening Stop Protection (4x 70-day ATR cap)
+    ATR_Baseline(0),
+    MaxStopDistance(0),
+    ATR_Stop_Distance(0),
+
+    // Re-Entry with EMA Smoothed ATR
+    ATRBuy_Value(0),
+    double ATR_Entry_Smooth(0),
+    BuyTouchLevel(0),
+    SellTouchLevel(0),
+    NewBuyTouchLevel(0),
+    NewSellTouchLevel(0),
+
+    // Trend Filter for Flat Entry
+    double Trend_EMA(0),
+    double Trend_Slope(0),
+
+    // Entry control flags
+    bool AllowLongEntry(false),
+    bool AllowShortEntry(false),
+    bool BothTriggered(false),
+    bool PlaceLong(false),
+    bool PlaceShort(false),
+
+    // P/L Reinvestment Variables
+    EffNP(0),
+    BaseNP(0),
+    BaseTT(0),
+    bool BaselineSet(false),
+    bool InRealTime(false),
+    CapitalForNextTrade(0),
+    SharesToBuy(0),
+
+    // Tracking
+    PrevMarketPosition(0),
+
+    // Debug
+    string printableDate(""),
+    string ScalingMethodName(""),
+    string PriceMethodName(""),
+    string EntryModeName(""),
+    string BothTriggeredModeName(""),
+    string TrendDirectionName("");
+
+// CRITICAL: Tell TradeStation trail amount is per SHARE, not total position
+once SetStopShare;
+
+// -------------------------------------------------------------
+// Initialize
+// -------------------------------------------------------------
+If CurrentBar = 1 then begin
+    If Scaling_Method = 0 then
+        ScalingMethodName = "Linear"
+    else If Scaling_Method = 1 then
+        ScalingMethodName = "SquareRoot"
+    else If Scaling_Method = 2 then
+        ScalingMethodName = "Exponential"
+    else
+        ScalingMethodName = "Unknown";
+
+    If EquityPrice_Method = 0 then
+        PriceMethodName = "TypicalPrice"
+    else
+        PriceMethodName = "Close";
+
+    If Entry_Mode = 0 then
+        EntryModeName = "Symmetric (Flat Only)"
+    else If Entry_Mode = 1 then
+        EntryModeName = "Long Priority"
+    else If Entry_Mode = 2 then
+        EntryModeName = "Full Bidirectional"
+    else
+        EntryModeName = "Unknown";
+
+    If Both_Triggered_Mode = 0 then
+        BothTriggeredModeName = "Long Priority"
+    else If Both_Triggered_Mode = 1 then
+        BothTriggeredModeName = "Skip Both"
+    else
+        BothTriggeredModeName = "Unknown";
+
+    if PrintTesting then begin
+        Print("BIDIRECTIONAL DUAL SYMBOL HYBRID MODEL");
+        Print("Data1=Leveraged ETF, Data2=Index ETF");
+        Print("Price Method: ", PriceMethodName, " | BB Scaling: ", ScalingMethodName);
+        Print("Entry Mode: ", Entry_Mode, " - ", EntryModeName);
+        Print("Both Triggered: ", Both_Triggered_Mode, " - ", BothTriggeredModeName);
+        Print("Entry: Data1 (correct scale) | Tightening: Data2 (stable signal)");
+    end;
+end;
+
+// -------------------------------------------------------------
+// Set Current Price for BB calculations (Data2 - Index ETF)
+// -------------------------------------------------------------
+If EquityPrice_Method = 0 then
+    CurrentPrice = TypicalPrice of Data2
+else
+    CurrentPrice = Close of Data2;
+
+// Calculate HL2 for base stop from Data1 (Leveraged ETF)
+HL2 = (High + Low) / 2;  // Data1 implied
+
+// -------------------------------------------------------------
+// Calculate ATR for Stop Loss (Data1 - Leveraged ETF)
+// CRITICAL: Must use Data1's actual volatility for stops
+// -------------------------------------------------------------
+If CurrentBar > ATR_Period then
+    ATR_Value = AvgTrueRange(ATR_Period)  // Data1 implied
+else
+    ATR_Value = 0;
+
+// -------------------------------------------------------------
+// Calculate ATR for Short Exits (scaled period and multiplier)
+// -------------------------------------------------------------
+ATR_Period_Short = Round(ATR_Period * Short_Multiplier, 0);
+If ATR_Period_Short < 1 then ATR_Period_Short = 1;
+
+If CurrentBar > ATR_Period_Short then
+    ATR_Value_Short = AvgTrueRange(ATR_Period_Short)  // Data1 implied
+else
+    ATR_Value_Short = 0;
+
+// -------------------------------------------------------------
+// Calculate ATR Baseline for Opening Stop Protection
+// Cap at 4x 70-day ATR to limit opening risk during volatility spikes
+// This protection fades as trailing stop tightens via BB
+// -------------------------------------------------------------
+If CurrentBar > 70 then begin
+    ATR_Baseline = AvgTrueRange(70);  // Data1 implied
+    MaxStopDistance = ATR_Baseline * 4;
+end
+else begin
+    ATR_Baseline = 0;
+    MaxStopDistance = 0;
+end;
+
+// -------------------------------------------------------------
+// Calculate Bollinger Band Width (Data2 - Index ETF)
+// HYBRID: Use Data2 for cleaner volatility tightening signal
+// -------------------------------------------------------------
+If CurrentBar of Data2 > BB_Length then begin
+    // CRITICAL: BollingerBandWidth requires a price SERIES with historical data
+    // Calculate from Data2 (Index) for stable volatility signal
+    // NOTE: Must use "Close of Data2" explicitly inside the function -
+    // the "of Data2" suffix doesn't propagate to arguments
+    BB_Width = BollingerBandWidth(Close of Data2, BB_Length, BB_Deviation, -BB_Deviation);
+
+    if PrintTesting and CurrentBar of Data2 = BB_Length + 1 then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date of Data2));
+        Print(printableDate, " BB_Width FIRST CALC (Data2): ", BB_Width:0:4);
+        Print("  Using Close of Data2, BB_Length=", BB_Length:0:0);
+        Print("  BB_Deviation=", BB_Deviation:0:2, " Data2 Close=", Close of Data2:0:2);
+    end;
+end
+else
+    BB_Width = 0;
+
+// -------------------------------------------------------------
+// Calculate ATR for Buy-If-Touched Re-Entry (Data1 - Leveraged ETF)
+// HYBRID: Use Data1's own ATR for entry (correct price scale)
+// -------------------------------------------------------------
+If CurrentBar > ATRBuy_Period then
+    ATRBuy_Value = AvgTrueRange(ATRBuy_Period)  // Data1 implied
+else
+    ATRBuy_Value = 0;
+
+// -------------------------------------------------------------
+// Smooth ATR with EMA for Entry (Data1)
+// -------------------------------------------------------------
+If ATRBuy_Value > 0 then
+    ATR_Entry_Smooth = XAverage(ATRBuy_Value, ATR_Smooth_Period)  // Data1 implied
+else
+    ATR_Entry_Smooth = 0;
+
+// -------------------------------------------------------------
+// Calculate Trend Filter EMA and Slope (Data1 - Leveraged ETF)
+// Used to determine which direction to enter when flat
+// -------------------------------------------------------------
+If CurrentBar > Trend_Filter_Period then begin
+    Trend_EMA = XAverage(Close, Trend_Filter_Period);  // Data1 implied
+    Trend_Slope = Trend_EMA - Trend_EMA[1];  // Positive = uptrend, Negative = downtrend
+
+    // Determine trend direction name
+    If Trend_Slope > 0 then
+        TrendDirectionName = "UP"
+    else If Trend_Slope < 0 then
+        TrendDirectionName = "DOWN"
+    else
+        TrendDirectionName = "FLAT";
+
+    if PrintTesting and mod(CurrentBar, 20) = 0 then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " TREND FILTER: EMA(", Trend_Filter_Period, ")=", Trend_EMA:0:2,
+              " Slope=", Trend_Slope:0:4, " (", TrendDirectionName, ")");
+    end;
+end
+else begin
+    Trend_EMA = 0;
+    Trend_Slope = 0;
+    TrendDirectionName = "N/A";
+end;
+
+// -------------------------------------------------------------
+// Calculate Floating Buy/Sell-If-Touched Levels (Data1 - Leveraged ETF)
+// HYBRID: Uses Data1's price and ATR (correct scale, no conversion needed)
+// CRITICAL: Must calculate levels based on what positions are ALLOWED, not just flat
+// Mode 1: Long can flip from short, so calculate BuyTouch even when short
+// Mode 2: Both can flip, so calculate both levels when in either position
+// Entry_Ratchet=0: Recalculates every bar (floats with price)
+// Entry_Ratchet=1: Only lowers BuyTouch / only raises SellTouch (catches slow drifts)
+// -------------------------------------------------------------
+If ATR_Entry_Smooth > 0 then begin
+    // Calculate BuyTouchLevel if:
+    // - Flat (all modes), OR
+    // - Short and can flip to long (Mode 1 or 2)
+    If MarketPosition = 0 or
+       (MarketPosition = -1 and (Entry_Mode = 1 or Entry_Mode = 2)) then begin
+        NewBuyTouchLevel = Close + (ATR_Entry_Smooth * ATRBuyMultiplier);  // Data1 implied
+
+        If Entry_Ratchet = 0 then begin
+            // Floating mode: always use new calculated level
+            BuyTouchLevel = NewBuyTouchLevel;
+        end
+        else begin
+            // Ratchet mode: only lower, never raise
+            If BuyTouchLevel = 0 or NewBuyTouchLevel < BuyTouchLevel then
+                BuyTouchLevel = NewBuyTouchLevel;
+        end;
+    end
+    else begin
+        BuyTouchLevel = 0;  // Not allowed to enter long
+    end;
+
+    // Calculate SellTouchLevel if:
+    // - Flat (all modes), OR
+    // - Long and can flip to short (Mode 2 only)
+    If MarketPosition = 0 or
+       (MarketPosition = 1 and Entry_Mode = 2) then begin
+        NewSellTouchLevel = Close - (ATR_Entry_Smooth * ATRBuyMultiplier);  // Data1 implied
+
+        If Entry_Ratchet = 0 then begin
+            // Floating mode: always use new calculated level
+            SellTouchLevel = NewSellTouchLevel;
+        end
+        else begin
+            // Ratchet mode: only raise, never lower (inverse of long)
+            If SellTouchLevel = 0 or NewSellTouchLevel > SellTouchLevel then
+                SellTouchLevel = NewSellTouchLevel;
+        end;
+    end
+    else begin
+        SellTouchLevel = 0;  // Not allowed to enter short
+    end;
+
+    if PrintTesting and (BuyTouchLevel > 0 or SellTouchLevel > 0) then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " Entry Levels (Mode ", Entry_Mode, ", MP=", MarketPosition,
+              ", Ratchet=", Entry_Ratchet, "):");
+        If BuyTouchLevel > 0 then
+            Print("  BuyTouch(Data1)=", BuyTouchLevel:0:2, " [New=", NewBuyTouchLevel:0:2, "]");
+        If SellTouchLevel > 0 then
+            Print("  SellTouch(Data1)=", SellTouchLevel:0:2, " [New=", NewSellTouchLevel:0:2, "]");
+        Print("  (Data1 Close=", Close:0:2, " ± ATR_EMA=", ATR_Entry_Smooth:0:3,
+              " × ", ATRBuyMultiplier:0:2, ")");
+    end;
+end
+else begin
+    BuyTouchLevel = 0;
+    SellTouchLevel = 0;
+end;
+
+// -------------------------------------------------------------
+// Calculate BB Multiplier for Stop Tightening
+// HYBRID: Uses Data2 BB Width for stable tightening signal
+// -------------------------------------------------------------
+If BB_Width >= Vol_Threshold then begin
+    // Normal volatility: No tightening
+    BB_Multiplier = 1.0;
+end
+else begin
+    // Low volatility: Apply tightening based on scaling method
+
+    // METHOD 0: LINEAR SCALING (Original)
+    If Scaling_Method = 0 then begin
+        BB_Multiplier = BB_Width / Vol_Threshold;
+    end;
+
+    // METHOD 1: SQUARE ROOT SCALING (Gentler)
+    If Scaling_Method = 1 then begin
+        BB_Multiplier = SquareRoot(BB_Width / Vol_Threshold);
+    end;
+
+    // METHOD 2: EXPONENTIAL SCALING (More Aggressive)
+    If Scaling_Method = 2 then begin
+        BB_Multiplier = Square(BB_Width / Vol_Threshold);
+    end;
+
+    // Apply minimum to prevent over-tightening
+    If BB_Multiplier < Min_Tightening then
+        BB_Multiplier = Min_Tightening;
+end;
+
+if PrintTesting and BB_Multiplier < 1.0 then begin
+    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+    Print(printableDate, " BB TIGHTENING (", ScalingMethodName, "): Data2_BBWidth=", BB_Width:0:4,
+          " Threshold=", Vol_Threshold:0:2, " Multiplier=", BB_Multiplier:0:3);
+end;
+
+// -------------------------------------------------------------
+// Baseline Logic (RunLive mode)
+// -------------------------------------------------------------
+InRealTime = (GetAppInfo(aiRealTimeCalc) = 1);
+
+If RunLive then begin
+    If InRealTime and not BaselineSet then begin
+        if PrintTesting then
+            Print("REALTIME BASELINE SET: NetProfit=", NetProfit, " TotalTrades=", TotalTrades);
+        BaseNP = NetProfit;
+        BaseTT = TotalTrades;
+        BaselineSet = true;
+    end;
+
+    If BaselineSet then begin
+        EffNP = NetProfit - BaseNP;
+        If TotalTrades <= BaseTT then
+            EffNP = 0;
+    end
+    else begin
+        EffNP = -InitialInvestment;
+    end;
+end
+else begin
+    EffNP = NetProfit;
+end;
+
+// -------------------------------------------------------------
+// Capital & Position Sizing
+// CRITICAL: Based on Data1 price (Leveraged ETF)
+// -------------------------------------------------------------
+CapitalForNextTrade = InitialInvestment + EffNP;
+
+If CapitalForNextTrade < 0 then
+    CapitalForNextTrade = 0;
+
+// Position sizing based on Data1 Close (Leveraged ETF actual price)
+If Close > 0 then  // Data1 implied
+    SharesToBuy = IntPortion(CapitalForNextTrade / Close)
+else
+    SharesToBuy = 0;
+
+If SharesToBuy < 0 then
+    SharesToBuy = 0;
+
+// -------------------------------------------------------------
+// ENTRY LOGIC: Configurable Flip Behavior via Entry_Mode
+// Mode 0: Symmetric - Both require flat
+// Mode 1: Long Priority - Long flips from short, short needs flat
+// Mode 2: Full BiDir - Both can flip from opposite position
+//
+// TREND VETO FILTER:
+// When both long and short are possible (flat, both enabled):
+// - Uses Trend_Filter_Period EMA slope as VETO, not choice
+// - DEFAULT: LONG (bull market bias)
+// - VETO: Only allow SHORT if slope < -Trend_Veto_Threshold
+// - Prevents daily noise from causing shorts in bull markets
+// - Both_Triggered_Mode only used if slope exactly = -Threshold (rare)
+// -------------------------------------------------------------
+If CurrentBar > MaxList(ATR_Period, ATRBuy_Period) and
+   CurrentBar of Data2 > BB_Length and
+   ATR_Value > 0 and ATRBuy_Value > 0 and SharesToBuy > 0 then begin
+
+    // ==========================================================
+    // STEP 1: Determine if long/short entries are allowed
+    // ==========================================================
+    // Reset entry control flags
+    AllowLongEntry = false;
+    AllowShortEntry = false;
+    BothTriggered = false;
+    PlaceLong = false;
+    PlaceShort = false;
+
+    // Long entry conditions based on Entry_Mode
+    If Entry_Mode = 0 then begin
+        // MODE 0: Symmetric - Long only from flat
+        AllowLongEntry = (MarketPosition = 0);
+    end
+    else If Entry_Mode = 1 or Entry_Mode = 2 then begin
+        // MODE 1 & 2: Long can flip from short
+        AllowLongEntry = (MarketPosition <= 0);
+    end;
+
+    // Short entry conditions based on Entry_Mode
+    If Entry_Mode = 0 or Entry_Mode = 1 then begin
+        // MODE 0 & 1: Short only from flat
+        AllowShortEntry = (MarketPosition = 0);
+    end
+    else If Entry_Mode = 2 then begin
+        // MODE 2: Short can flip from long
+        AllowShortEntry = (MarketPosition >= 0);
+    end;
+
+    // ==========================================================
+    // STEP 2: Check if BOTH directions are possible (when flat)
+    // Use TREND VETO FILTER to decide which order to place
+    // ==========================================================
+    BothTriggered = (EnableLongTrades and BuyTouchLevel > 0 and AllowLongEntry and
+                     EnableShortTrades and SellTouchLevel > 0 and AllowShortEntry);
+
+    // Resolve using Trend Veto Filter (default to LONG)
+    If BothTriggered then begin
+        // Both directions possible - use trend slope as VETO
+        // DEFAULT: LONG (bull market bias)
+        // VETO: Only allow SHORT if slope < -Trend_Veto_Threshold (strong downtrend)
+
+        If Trend_Slope < -Trend_Veto_Threshold then begin
+            // STRONG DOWNTREND: Veto long, allow short
+            PlaceLong = false;
+            PlaceShort = true;
+
+            if PrintTesting then begin
+                printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                Print(printableDate, " *** BOTH POSSIBLE - STRONG DOWNTREND - VETO LONG, ALLOW SHORT ***");
+                Print("  Trend_Slope=", Trend_Slope:0:4, " < -Threshold(", -Trend_Veto_Threshold:0:4, ")");
+                Print("  BuyTouch=", BuyTouchLevel:0:2, " SellTouch=", SellTouchLevel:0:2);
+            end;
+        end
+        else If Trend_Slope = -Trend_Veto_Threshold then begin
+            // EXACTLY AT THRESHOLD (rare): Use Both_Triggered_Mode as tiebreaker
+            If Both_Triggered_Mode = 0 then begin
+                // MODE 0: Long Priority
+                PlaceLong = true;
+                PlaceShort = false;
+
+                if PrintTesting then begin
+                    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                    Print(printableDate, " *** BOTH POSSIBLE - AT THRESHOLD - LONG PRIORITY ***");
+                    Print("  Trend_Slope=", Trend_Slope:0:4, " = -Threshold(", -Trend_Veto_Threshold:0:4, ")");
+                    Print("  BuyTouch=", BuyTouchLevel:0:2, " SellTouch=", SellTouchLevel:0:2);
+                end;
+            end
+            else If Both_Triggered_Mode = 1 then begin
+                // MODE 1: Skip Both
+                PlaceLong = false;
+                PlaceShort = false;
+
+                if PrintTesting then begin
+                    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                    Print(printableDate, " *** BOTH POSSIBLE - AT THRESHOLD - SKIPPING BOTH ***");
+                    Print("  Trend_Slope=", Trend_Slope:0:4, " = -Threshold(", -Trend_Veto_Threshold:0:4, ")");
+                    Print("  BuyTouch=", BuyTouchLevel:0:2, " SellTouch=", SellTouchLevel:0:2);
+                    Print("  Waiting for clearer trend direction");
+                end;
+            end;
+        end
+        else begin
+            // NOT STRONG DOWNTREND (default): Allow long, veto short
+            PlaceLong = true;
+            PlaceShort = false;
+
+            if PrintTesting then begin
+                printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                Print(printableDate, " *** BOTH POSSIBLE - DEFAULT TO LONG (VETO SHORT) ***");
+                Print("  Trend_Slope=", Trend_Slope:0:4, " >= -Threshold(", -Trend_Veto_Threshold:0:4, ")");
+                Print("  BuyTouch=", BuyTouchLevel:0:2, " SellTouch=", SellTouchLevel:0:2);
+            end;
+        end;
+    end
+    else begin
+        // Only one direction possible - place that order
+        PlaceLong = (EnableLongTrades and BuyTouchLevel > 0 and AllowLongEntry);
+        PlaceShort = (EnableShortTrades and SellTouchLevel > 0 and AllowShortEntry);
+    end;
+
+    // ==========================================================
+    // STEP 3: LONG ENTRY - Place order if PlaceLong is true
+    // ==========================================================
+    If PlaceLong and SharesToBuy > 0 then begin
+        // If currently short, cover first (Mode 1 or 2)
+        If MarketPosition = -1 then begin
+            BuyToCover ("SX-FlipLong") Next Bar at Market;
+
+            if PrintTesting then begin
+                printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                Print(printableDate, " *** FLIPPING SHORT → LONG (Mode ", Entry_Mode, ") ***");
+                Print("     Covering short at market, entering long at ", BuyTouchLevel:0:2);
+            end;
+        end;
+
+        // Enter long at buy-if-touched level
+        Buy ("LE-BuyTouch") SharesToBuy shares Next Bar at BuyTouchLevel Stop;
+
+        // CRITICAL: Set initial stop for entry bar (Data1 calculations)
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value * ATR_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 - ATR_Stop_Distance;
+        FinalStop_Long = BasicStop;
+        TrailAmtPerShare = Close - BasicStop;
+
+        If TrailAmtPerShare > 0 then
+            SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            If MarketPosition = 0 then
+                Print(printableDate, " LONG ENTRY from FLAT (Mode ", Entry_Mode, ")")
+            else If MarketPosition = -1 then
+                Print(printableDate, " LONG ENTRY via FLIP from SHORT (Mode ", Entry_Mode, ")");
+            Print(printableDate, " | Buy-If-Touched | Shares=", SharesToBuy,
+                  " TouchLevel(Data1)=", BuyTouchLevel:0:2);
+            Print(printableDate, " [ENTRY] Data1: InitialStop=", BasicStop:0:2,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+
+    // ==========================================================
+    // STEP 4: SHORT ENTRY - Place order if PlaceShort is true
+    // ==========================================================
+    If PlaceShort and SharesToBuy > 0 then begin
+        // If currently long, exit first (Mode 2 only)
+        If MarketPosition = 1 then begin
+            Sell ("LX-FlipShort") Next Bar at Market;
+
+            if PrintTesting then begin
+                printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+                Print(printableDate, " *** FLIPPING LONG → SHORT (Mode 2 only) ***");
+                Print("     Exiting long at market, entering short at ", SellTouchLevel:0:2);
+            end;
+        end;
+
+        // Enter short at sell-if-touched level
+        SellShort ("SE-SellTouch") SharesToBuy shares Next Bar at SellTouchLevel Stop;
+
+        // CRITICAL: Set initial stop for entry bar (Data1 calculations)
+        // Uses scaled ATR for short exits
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value_Short * ATR_Multiplier * Short_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 + ATR_Stop_Distance;  // ABOVE price for shorts
+        FinalStop_Short = BasicStop;
+        TrailAmtPerShare = BasicStop - Close;  // Distance FROM stop TO price
+
+        If TrailAmtPerShare > 0 then
+            SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            If MarketPosition = 0 then
+                Print(printableDate, " SHORT ENTRY from FLAT (Mode ", Entry_Mode, ")")
+            else If MarketPosition = 1 then
+                Print(printableDate, " SHORT ENTRY via FLIP from LONG (Mode 2 only)");
+            Print(printableDate, " | Sell-If-Touched | Shares=", SharesToBuy,
+                  " TouchLevel(Data1)=", SellTouchLevel:0:2);
+            Print(printableDate, " [ENTRY] Data1: InitialStop=", BasicStop:0:2,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+
+end;
+
+// -------------------------------------------------------------
+// STOP LOSS MANAGEMENT: ATR Trailing with BB Tightening
+// HYBRID: Stops from Data1, Tightening from Data2
+// Uses SetDollarTrailing for server-side execution
+// -------------------------------------------------------------
+
+// LONG Position Stop
+If MarketPosition = 1 and ATR_Value > 0 then begin
+    // Step 1: Calculate BasicStop from Data1 (Leveraged ETF)
+    // NO cap here - cap only applies at entry to limit initial risk
+    // Wide stops are allowed during position to avoid premature exits
+    BasicStop = HL2 - (ATR_Value * ATR_Multiplier);
+
+    if PrintTesting then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " [LONG DEBUG] Data1: HL2=", HL2:0:2, " ATR=", ATR_Value:0:3,
+              " Multiplier=", ATR_Multiplier:0:2, " BasicStop=", BasicStop:0:2);
+    end;
+
+    // Step 2: Calculate FinalStop (trails upward only)
+    If FinalStop_Long = 0 then begin
+        FinalStop_Long = BasicStop;
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] INITIALIZING FinalStop_Long=", FinalStop_Long:0:2);
+    end
+    else If BasicStop > FinalStop_Long then begin
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] TRAILING UP: Old=", FinalStop_Long:0:2,
+                  " New=", BasicStop:0:2, " Diff=", (BasicStop - FinalStop_Long):0:2);
+        FinalStop_Long = BasicStop;
+    end
+    else begin
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] HOLDING: FinalStop=", FinalStop_Long:0:2,
+                  " BasicStop=", BasicStop:0:2, " (not trailing)");
+    end;
+
+    // Step 3: Calculate distance from Close to FinalStop
+    StopDistance = Close - FinalStop_Long;
+
+    if PrintTesting then begin
+        Print(printableDate, " [LONG DEBUG] Data1: Close=", Close:0:2, " FinalStop=", FinalStop_Long:0:2,
+              " StopDistance=", StopDistance:0:2);
+        Print(printableDate, " [LONG DEBUG] Data2: BB_Width=", BB_Width:0:4,
+              " BB_Multiplier=", BB_Multiplier:0:3);
+    end;
+
+    // Step 4: Apply BB multiplier from Data2 to Data1 stop distance
+    // HYBRID: Data2's BB Width tightens Data1's stop
+    TrailAmtPerShare = StopDistance * BB_Multiplier;
+
+    if PrintTesting then begin
+        Print(printableDate, " [LONG DEBUG] HYBRID: StopDistance(Data1)=", StopDistance:0:2,
+              " × BB_Mult(Data2)=", BB_Multiplier:0:3, " = TrailAmt=", TrailAmtPerShare:0:2);
+    end;
+
+    // CRITICAL: If < 0, price has already dropped below FinalStop
+    If TrailAmtPerShare < 0 then begin
+        Sell ("LX-StopBreach") Next Bar at Market;
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " ***** LONG STOP BREACHED! Data1 Close=", Close:0:2,
+                  " FinalStop=", FinalStop_Long:0:2, " EXITING AT MARKET *****");
+        end;
+    end
+    else begin
+        SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " LONG STOP: Data1 Close=", Close:0:2, " FinalStop=", FinalStop_Long:0:2,
+                  " StopDist=", StopDistance:0:2, " Data2_BBMult=", BB_Multiplier:0:3,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+end
+else If MarketPosition <> 1 then begin
+    // Reset when not in long position
+    FinalStop_Long = 0;
+end;
+
+// SHORT Position Stop (uses scaled ATR period and multiplier)
+If MarketPosition = -1 and ATR_Value_Short > 0 then begin
+    // Step 1: Calculate BasicStop (ABOVE price for shorts, scaled)
+    // NO cap here - cap only applies at entry to limit initial risk
+    // Wide stops are allowed during position to avoid premature exits
+    BasicStop = HL2 + (ATR_Value_Short * ATR_Multiplier * Short_Multiplier);
+
+    if PrintTesting then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " [SHORT DEBUG] Data1: HL2=", HL2:0:2, " ATR_Short=", ATR_Value_Short:0:3,
+              " Multiplier=", (ATR_Multiplier * Short_Multiplier):0:2, " BasicStop=", BasicStop:0:2);
+    end;
+
+    // Step 2: Calculate FinalStop (trails DOWNWARD for shorts)
+    If FinalStop_Short = 0 then begin
+        FinalStop_Short = BasicStop;
+        if PrintTesting then
+            Print(printableDate, " [SHORT DEBUG] INITIALIZING FinalStop_Short=", FinalStop_Short:0:2);
+    end
+    else If BasicStop < FinalStop_Short then begin  // LOWER is better for shorts
+        if PrintTesting then
+            Print(printableDate, " [SHORT DEBUG] TRAILING DOWN: Old=", FinalStop_Short:0:2,
+                  " New=", BasicStop:0:2, " Diff=", (FinalStop_Short - BasicStop):0:2);
+        FinalStop_Short = BasicStop;
+    end
+    else begin
+        if PrintTesting then
+            Print(printableDate, " [SHORT DEBUG] HOLDING: FinalStop=", FinalStop_Short:0:2,
+                  " BasicStop=", BasicStop:0:2, " (not trailing)");
+    end;
+
+    // Step 3: Calculate distance (FROM stop TO price)
+    StopDistance = FinalStop_Short - Close;
+
+    if PrintTesting then begin
+        Print(printableDate, " [SHORT DEBUG] Data1: Close=", Close:0:2, " FinalStop=", FinalStop_Short:0:2,
+              " StopDistance=", StopDistance:0:2);
+        Print(printableDate, " [SHORT DEBUG] Data2: BB_Width=", BB_Width:0:4,
+              " BB_Multiplier=", BB_Multiplier:0:3);
+    end;
+
+    // Step 4: Apply BB multiplier from Data2
+    TrailAmtPerShare = StopDistance * BB_Multiplier;
+
+    if PrintTesting then begin
+        Print(printableDate, " [SHORT DEBUG] HYBRID: StopDistance(Data1)=", StopDistance:0:2,
+              " × BB_Mult(Data2)=", BB_Multiplier:0:3, " = TrailAmt=", TrailAmtPerShare:0:2);
+    end;
+
+    // CRITICAL: If < 0, price has already risen above FinalStop
+    If TrailAmtPerShare < 0 then begin
+        BuyToCover ("SX-StopBreach") Next Bar at Market;
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " ***** SHORT STOP BREACHED! Data1 Close=", Close:0:2,
+                  " FinalStop=", FinalStop_Short:0:2, " COVERING AT MARKET *****");
+        end;
+    end
+    else begin
+        SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " SHORT STOP: Data1 Close=", Close:0:2, " FinalStop=", FinalStop_Short:0:2,
+                  " StopDist=", StopDistance:0:2, " Data2_BBMult=", BB_Multiplier:0:3,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+end
+else If MarketPosition <> -1 then begin
+    // Reset when not in short position
+    FinalStop_Short = 0;
+end;
+
+// -------------------------------------------------------------
+// Debug Output
+// -------------------------------------------------------------
+if PrintTesting and mod(CurrentBar, 20) = 0 then begin
+    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+    Print("========================================");
+    Print(printableDate, " BIDIRECTIONAL DUAL SYMBOL STATUS");
+    Print("Entry Mode: ", Entry_Mode, " - ", EntryModeName);
+    Print("Trend Veto: EMA(", Trend_Filter_Period, ")=", Trend_EMA:0:2,
+          " Slope=", Trend_Slope:0:4, " (", TrendDirectionName, ")");
+    Print("Veto Threshold: ", -Trend_Veto_Threshold:0:4, " (shorts only if slope < threshold)");
+    Print("Both Triggered Mode: ", Both_Triggered_Mode, " - ", BothTriggeredModeName);
+    Print("Data1 (Leveraged): ATR(", ATR_Period, ")=", ATR_Value:0:3, " Multiplier=", ATR_Multiplier:0:2);
+    Print("Data1 (Leveraged): Close=", Close:0:2);
+    Print("Data1: BuyTouch=", BuyTouchLevel:0:2, " SellTouch=", SellTouchLevel:0:2);
+    Print("Data1 (Entry ATR): ATR_Raw=", ATRBuy_Value:0:3, " ATR_EMA=", ATR_Entry_Smooth:0:3);
+    Print("Data2 (Index): BB_Width=", BB_Width:0:4, " Threshold=", Vol_Threshold:0:2);
+    Print("Data2 (Index): Close=", Close of Data2:0:2);
+    Print("BB Multiplier=", BB_Multiplier:0:3, " (", ScalingMethodName, ")");
+    Print("Enabled: Long=", EnableLongTrades, " Short=", EnableShortTrades);
+    Print("MarketPosition=", MarketPosition, " Capital=", CapitalForNextTrade:0:2);
+    Print("========================================");
+end;
+
+// -------------------------------------------------------------
+// Update Previous Position for Next Bar
+// -------------------------------------------------------------
+PrevMarketPosition = MarketPosition;
+
+{-------------------------------------------------------------
+ IMPLEMENTATION NOTES - BIDIRECTIONAL DUAL SYMBOL HYBRID MODEL
+--------------------------------------------------------------
+ This strategy implements a BIDIRECTIONAL buy-and-hold approach
+ with configurable entry flip behavior using HYBRID MODEL.
+
+ Entry Mode Testing Guide:
+
+ 1. MODE 0 (Symmetric - Flat Only):
+    - Set Entry_Mode = 0
+    - Both long and short require flat position
+    - Most conservative, no flipping
+    - Compare to classic strategies
+    - Expect: Lower trade frequency, less whipsaw
+
+ 2. MODE 1 (Long Priority - Default):
+    - Set Entry_Mode = 1
+    - Long can flip from short
+    - Short only from flat
+    - Asymmetric upside bias
+    - Best for leveraged long ETFs (TQQQ, UPRO)
+    - Expect: More upside capture, reduced short exposure
+
+ 3. MODE 2 (Full Bidirectional):
+    - Set Entry_Mode = 2
+    - Both directions can flip
+    - Most responsive, highest trade frequency
+    - Monitor whipsaw count
+    - Expect: Best for range-bound markets
+
+ Trend Veto Filter (When Both Long and Short Possible):
+ - Calculates Trend_Filter_Period EMA slope on Data1
+ - DEFAULT: Place LONG order (bull market bias)
+ - VETO: Only allow SHORT if slope < -Trend_Veto_Threshold
+ - Example with Threshold=0.05:
+   * Slope = 0.02 (weak up) → LONG (veto short)
+   * Slope = -0.02 (weak down) → LONG (veto short, not below threshold)
+   * Slope = -0.08 (strong down) → SHORT (below threshold, veto long)
+ - Prevents whipsaws: Small slope changes don't flip direction
+ - Bull bias: Favors longs unless trend clearly down
+ - Optimization range: 0.01-0.20 (smaller = more shorts, larger = fewer shorts)
+
+ Data Distribution:
+ - Data1 (Leveraged ETF): All entry/stop ATR calculations, trend slope
+ - Data2 (Index ETF): BB Width for tightening signal only
+ - Hybrid Model: Correct price scaling + stable signals
+
+ Setup Instructions:
+ 1. Add Data1 (TQQQ, UPRO, SOXL) as primary symbol
+ 2. Add Data2 (QQQ, SPY, SOXX) as secondary symbol
+ 3. Both on same timeframe (daily recommended)
+ 4. Set Entry_Mode: 0=Symmetric, 1=Long Priority, 2=Full BiDir
+ 5. Set Trend_Filter_Period: 5-10 recommended (3-20 range)
+ 6. Set Trend_Veto_Threshold: 0.05 default (0-0.5 range)
+ 7. Apply strategy to chart
+--------------------------------------------------------------}
+
+// -------------------------------------------------------------
+// Close any open position at END OF OPTIMIZATION ONLY
+// Safe for live trading and backtesting - only triggers during optimization
+// -------------------------------------------------------------
+If LastBarOnChart and GetAppInfo(aiOptimizing) = 1 then begin
+    // We're on the last bar AND we're in optimization mode
+    // This closes positions for accurate optimization P/L calculation
+
+    If MarketPosition = 1 then
+        Sell ("LX-EndOfTest") this bar on Close;
+    If MarketPosition = -1 then
+        BuyToCover ("SX-EndOfTest") this bar on Close;
+end;
+
+{-------------------------------------------------------------
+ CHANGE LOG
+--------------------------------------------------------------
+ v1.4-BiDirectional-DualSymbol - 2025-12-15
+ - NEW: Short_Multiplier input for tighter short exits
+   * Scales both ATR_Period and ATR_Multiplier for short stops
+   * Range 0.2-1.0 (1.0 = same as longs, 0.2 = very tight)
+   * Separate ATR_Value_Short calculation with rounded period
+   * Tighter short exits reduce drawdown in bull markets
+
+ v1.4-BiDirectional-DualSymbol - 2025-11-24
+ - REDESIGN: Trend Veto Filter (was Trend Slope Filter)
+   * Changed from CHOICE to VETO pattern (critical for bull markets)
+   * Added Trend_Veto_Threshold input (default 0.05, range 0-0.5)
+   * DEFAULT: Place LONG orders (bull market bias for leveraged ETFs)
+   * VETO: Only allow SHORT if slope < -Threshold (strong downtrend)
+   * Prevents 50/50 long/short split in bull markets
+   * Reduces whipsaws from minor slope changes
+   * Lower transaction costs (fewer direction flips)
+   * Example: With threshold=0.05, slope must be < -0.05 to allow shorts
+   * Rationale: Markets trend up long-term, leverage amplifies upside
+ - ORIGINAL: Trend Slope Filter (removed - caused excessive whipsaws)
+   * Old logic: Any positive slope → long, any negative → short
+   * Problem: Created ~50/50 long/short in bull market
+   * Problem: 787 trades with 2-3 day EMA (daily noise)
+   * Problem: Performance 1/3 of long-only despite bull market
+ - CRITICAL BUGFIX: Dual entry conflict - both orders placed on same bar
+   * When flat, BOTH long and short orders were placed simultaneously
+   * Caused unpredictable execution, wrong position sizes, strategy collapse
+   * Now uses trend slope filter to choose ONE direction when both possible
+   * Both_Triggered_Mode only used as tiebreaker when slope exactly = 0
+   * Mode 0: When trend flat, place long order (long bias)
+   * Mode 1: When trend flat, skip both and wait for trend direction
+ - CRITICAL BUGFIX: Entry level calculation logic was broken
+   * BuyTouchLevel only calculated when MarketPosition = 0
+   * In Mode 1/2, when SHORT, BuyTouchLevel stayed 0 (couldn't flip to long!)
+   * In Mode 2, when LONG, SellTouchLevel stayed 0 (couldn't flip to short!)
+   * Strategy got stuck in losing positions, couldn't flip out
+   * Now calculates levels based on Entry_Mode and allowed flips
+   * Mode 1: BuyTouch calculated when flat OR short (can flip)
+   * Mode 2: Both levels calculated when flat OR in opposite position
+ - BUGFIX: Added missing SharesToBuy > 0 check to entry conditions
+   * Long entry was missing capital validation
+   * Short entry was missing capital validation
+   * This caused 0-share orders and performance collapse
+   * Now matches long-only version's validation logic
+ - NEW: Bidirectional support (long and short positions)
+ - NEW: Configurable entry flip behavior via Entry_Mode input
+ - Mode 0: Symmetric - both directions require flat
+ - Mode 1: Long Priority - long flips from short, short needs flat (DEFAULT)
+ - Mode 2: Full BiDir - both directions can flip
+ - NEW: SellTouchLevel for short entries
+ - NEW: FinalStop_Short for short position trailing
+ - NEW: EnableLongTrades and EnableShortTrades inputs
+ - Hybrid Model preserved from v1.4-DualSymbol
+ - All Data1/Data2 calculations maintained
+ - Allows testing different flip strategies
+ - Long priority mode suitable for leveraged long ETFs
+ - Full bidirectional mode for aggressive mean reversion
+
+ Based on v1.4-DualSymbol (Hybrid Model) - 2025-11-23
+ - Dual symbol support with HYBRID MODEL
+ - Entry calculations from Data1 (correct price scale)
+ - BB tightening from Data2 (stable volatility signal)
+ - EMA smoothing for ATR component
+ - Floating entry formula preserved
+--------------------------------------------------------------}

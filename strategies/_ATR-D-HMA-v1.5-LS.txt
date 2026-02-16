@@ -1,0 +1,445 @@
+{-------------------------------------------------------------
+ Strategy: ATR-D-HMA-v1.5-LS
+ Version: 1.5 (HMA Entry with Re-Entry, Cap-on-Entry, Bidirectional)
+ Date: 2026-01-08
+ Platform: TradeStation EasyLanguage
+ Timeframe: Daily bars
+
+ Description: HMA crossover entry with re-entry after stop-out.
+              Bidirectional version (long and short).
+
+              ENTRY METHODS:
+              1. HMA Bull/Bear Cross - Primary entry signal
+              2. Buy-Touch Re-Entry - After stop-out, re-enter
+                 in trend direction using momentum breakout
+
+              Re-entry is filtered by HMA trend:
+              - HMA_Fast > HMA_Slow: Only long re-entries allowed
+              - HMA_Fast < HMA_Slow: Only short re-entries allowed
+
+              No ATR% filter - preserves crossover signal information.
+
+ Data Setup:
+   Data1 = Primary symbol (e.g., AAPL)
+--------------------------------------------------------------}
+
+Inputs:
+    Name("ATR-D-HMA-LS") [DisplayName = "Strategy Name"],
+    InitialInvestment(10000)  [DisplayName = "Initial Capital ($)"],
+    RunLive(false)            [DisplayName = "Run Live Mode"],
+
+    // ATR Trailing Stop Parameters
+    ATR_Period(14)            [DisplayName = "[4-70][1] ATR Period (Stop Loss)"],
+    ATR_Multiplier(2.0)       [DisplayName = "[1-30][.25] ATR Multiplier"],
+    Short_Multiplier(1.0)     [DisplayName = "[.2-1][.1] Short Exit Multiplier"],
+
+    // Bollinger Band Tightening Parameters
+    BB_Length(20)             [DisplayName = "[6-70][2] BB Length"],
+    BB_Deviation(2.0)         [DisplayName = "[1-4][.25] BB Std Deviations"],
+    Vol_Threshold(0.10)       [DisplayName = "[.02-.4][.02] BB Width Threshold"],
+    Min_Tightening(0.10)      [DisplayName = "[.1-.95][.05] Min Tightening"],
+
+    // Scaling Method
+    Scaling_Method(0)         [DisplayName = "[0-2][1] BB Scaling Method"],
+
+    // HMA Entry Parameters
+    HMA_Fast_Length(20)       [DisplayName = "[10-60][2] HMA Fast Period"],
+    HMA_Slow_Length(80)       [DisplayName = "[60-100][2] HMA Slow Period"],
+
+    // Re-Entry Parameters (Buy-Touch after stop-out)
+    ATRBuy_Period(14)         [DisplayName = "[4-70][1] ATR Period (Re-Entry)"],
+    ATRBuyMultiplier(2.0)     [DisplayName = "[.5-20][.25] ATR Multiplier (Re-Entry Buffer)"],
+    ATR_Smooth_Period(5)      [DisplayName = "[1-20][1] ATR EMA Smoothing Period"],
+    // Entry_Ratchet hardcoded to 0 (Float mode) - removed from optimization grid
+    // Analysis showed Entry_Ratchet=0 consistently outperformed in all v1.5 optimizations
+    // while doubling grid size (100% increase). Keeping code for manual testing if needed.
+    Entry_Ratchet(0)          [DisplayName = "Entry Ratchet (HARDCODED=0, not optimized)"],
+
+    // Price Selection
+    EquityPrice_Method(0)     [DisplayName = "[0-1][1] Price Method"],
+
+    // Trading Options
+    EnableLongTrades(true)    [DisplayName = "Enable Long"],
+    EnableShortTrades(true)   [DisplayName = "Enable Short"],
+
+    PrintTesting(false)       [DisplayName = "Debug Output"];
+
+Variables:
+    // Price Calculation
+    CurrentPrice(0),
+    HL2(0),
+
+    // ATR and Stop Management
+    ATR_Value(0),
+    ATR_Period_Short(0),
+    ATR_Value_Short(0),
+    BasicStop(0),
+    FinalStop_Long(0),
+    FinalStop_Short(0),
+    StopDistance(0),
+    TrailAmtPerShare(0),
+
+    // Bollinger Band
+    BB_Width(0),
+    BB_Multiplier(1.0),
+
+    // Opening Stop Protection (4x 70-day ATR cap)
+    ATR_Baseline(0),
+    MaxStopDistance(0),
+    ATR_Stop_Distance(0),
+
+    // HMA Crossover
+    HMA_Fast(0),
+    HMA_Slow(0),
+    bool HMA_BullCross(false),
+    bool HMA_BearCross(false),
+    bool HMA_BullTrend(false),
+    bool HMA_BearTrend(false),
+
+    // Re-Entry (Buy-Touch)
+    ATRBuy_Value(0),
+    double ATR_Entry_Smooth(0),
+    BuyTouchLevel_Long(0),
+    BuyTouchLevel_Short(0),
+    NewBuyTouchLevel_Long(0),
+    NewBuyTouchLevel_Short(0),
+    bool StoppedOutLong(false),
+    bool StoppedOutShort(false),
+
+    // P/L Variables
+    EffNP(0),
+    BaseNP(0),
+    BaseTT(0),
+    bool BaselineSet(false),
+    bool InRealTime(false),
+    CapitalForNextTrade(0),
+    SharesToBuy(0),
+
+    PrevMarketPosition(0),
+    string ScalingMethodName(""),
+    string PriceMethodName(""),
+    string printableDate("");
+
+once SetStopShare;
+
+// Initialize
+If CurrentBar = 1 then begin
+    If Scaling_Method = 0 then ScalingMethodName = "Linear"
+    else If Scaling_Method = 1 then ScalingMethodName = "SquareRoot"
+    else If Scaling_Method = 2 then ScalingMethodName = "Exponential"
+    else ScalingMethodName = "Unknown";
+
+    If EquityPrice_Method = 0 then PriceMethodName = "TypicalPrice"
+    else PriceMethodName = "Close";
+end;
+
+// Set Price
+If EquityPrice_Method = 0 then CurrentPrice = TypicalPrice
+else CurrentPrice = Close;
+
+HL2 = (High + Low) / 2;
+
+// Calculate ATR for Stop Loss
+If CurrentBar > ATR_Period then ATR_Value = AvgTrueRange(ATR_Period)
+else ATR_Value = 0;
+
+// Calculate ATR for Short Exits (scaled period and multiplier)
+ATR_Period_Short = Round(ATR_Period * Short_Multiplier, 0);
+If ATR_Period_Short < 1 then ATR_Period_Short = 1;
+If CurrentBar > ATR_Period_Short then ATR_Value_Short = AvgTrueRange(ATR_Period_Short)
+else ATR_Value_Short = 0;
+
+// Calculate ATR Baseline for Opening Stop Protection
+// Cap at 4x 70-day ATR to limit opening risk during volatility spikes
+If CurrentBar > 70 then begin
+    ATR_Baseline = AvgTrueRange(70);
+    MaxStopDistance = ATR_Baseline * 4;
+end
+else begin
+    ATR_Baseline = 0;
+    MaxStopDistance = 0;
+end;
+
+// Calculate BB Width
+If CurrentBar > BB_Length then
+    BB_Width = BollingerBandWidth(Close, BB_Length, BB_Deviation, -BB_Deviation)
+else BB_Width = 0;
+
+// Calculate BB Multiplier
+If BB_Width >= Vol_Threshold then BB_Multiplier = 1.0
+else begin
+    If Scaling_Method = 0 then BB_Multiplier = BB_Width / Vol_Threshold;
+    If Scaling_Method = 1 then BB_Multiplier = SquareRoot(BB_Width / Vol_Threshold);
+    If Scaling_Method = 2 then BB_Multiplier = Square(BB_Width / Vol_Threshold);
+    If BB_Multiplier < Min_Tightening then BB_Multiplier = Min_Tightening;
+end;
+
+// Calculate ATR for Re-Entry
+If CurrentBar > ATRBuy_Period then
+    ATRBuy_Value = AvgTrueRange(ATRBuy_Period)
+else
+    ATRBuy_Value = 0;
+
+// Smooth ATR with EMA for Re-Entry
+If ATRBuy_Value > 0 then
+    ATR_Entry_Smooth = XAverage(ATRBuy_Value, ATR_Smooth_Period)
+else
+    ATR_Entry_Smooth = 0;
+
+// Calculate HMA Crossover
+If CurrentBar > HMA_Slow_Length then begin
+    HMA_Fast = HMA(CurrentPrice, HMA_Fast_Length);
+    HMA_Slow = HMA(CurrentPrice, HMA_Slow_Length);
+
+    // Trend direction
+    HMA_BullTrend = (HMA_Fast > HMA_Slow);
+    HMA_BearTrend = (HMA_Fast < HMA_Slow);
+
+    If CurrentBar > HMA_Slow_Length + 1 then begin
+        HMA_BullCross = (HMA_Fast > HMA_Slow and HMA_Fast[1] <= HMA_Slow[1]);
+        HMA_BearCross = (HMA_Fast < HMA_Slow and HMA_Fast[1] >= HMA_Slow[1]);
+    end
+    else begin
+        HMA_BullCross = false;
+        HMA_BearCross = false;
+    end;
+end
+else begin
+    HMA_BullCross = false;
+    HMA_BearCross = false;
+    HMA_BullTrend = false;
+    HMA_BearTrend = false;
+end;
+
+// Detect stop-outs (position closed but not by crossover)
+If PrevMarketPosition = 1 and MarketPosition = 0 then begin
+    // Was long, now flat - check if it was a stop-out (not a bear cross exit)
+    If not HMA_BearCross[1] then
+        StoppedOutLong = true;
+end;
+
+If PrevMarketPosition = -1 and MarketPosition = 0 then begin
+    // Was short, now flat - check if it was a stop-out (not a bull cross exit)
+    If not HMA_BullCross[1] then
+        StoppedOutShort = true;
+end;
+
+// Reset stop-out flags on crossover (new primary signal available)
+If HMA_BullCross then begin
+    StoppedOutLong = false;
+    StoppedOutShort = false;
+end;
+If HMA_BearCross then begin
+    StoppedOutLong = false;
+    StoppedOutShort = false;
+end;
+
+// Calculate Re-Entry Levels (only when flat and stopped out)
+// Entry_Ratchet=0: Recalculates every bar (floats with price)
+// Entry_Ratchet=1: Only lowers Long level / only raises Short level (catches slow drifts)
+If MarketPosition = 0 and ATR_Entry_Smooth > 0 then begin
+    // Long re-entry level (breakout above)
+    If StoppedOutLong and HMA_BullTrend then begin
+        NewBuyTouchLevel_Long = Close + (ATR_Entry_Smooth * ATRBuyMultiplier);
+
+        If Entry_Ratchet = 0 then
+            BuyTouchLevel_Long = NewBuyTouchLevel_Long
+        else begin
+            // Ratchet mode: only lower, never raise
+            If BuyTouchLevel_Long = 0 or NewBuyTouchLevel_Long < BuyTouchLevel_Long then
+                BuyTouchLevel_Long = NewBuyTouchLevel_Long;
+        end;
+    end
+    else
+        BuyTouchLevel_Long = 0;
+
+    // Short re-entry level (breakdown below)
+    If StoppedOutShort and HMA_BearTrend then begin
+        NewBuyTouchLevel_Short = Close - (ATR_Entry_Smooth * ATRBuyMultiplier);
+
+        If Entry_Ratchet = 0 then
+            BuyTouchLevel_Short = NewBuyTouchLevel_Short
+        else begin
+            // Ratchet mode: only raise, never lower (inverse of long)
+            If BuyTouchLevel_Short = 0 or NewBuyTouchLevel_Short > BuyTouchLevel_Short then
+                BuyTouchLevel_Short = NewBuyTouchLevel_Short;
+        end;
+    end
+    else
+        BuyTouchLevel_Short = 0;
+end
+else begin
+    BuyTouchLevel_Long = 0;
+    BuyTouchLevel_Short = 0;
+end;
+
+// Baseline Logic
+InRealTime = (GetAppInfo(aiRealTimeCalc) = 1);
+
+If RunLive then begin
+    If InRealTime and not BaselineSet then begin
+        BaseNP = NetProfit; BaseTT = TotalTrades; BaselineSet = true;
+    end;
+    If BaselineSet then begin
+        EffNP = NetProfit - BaseNP;
+        If TotalTrades <= BaseTT then EffNP = 0;
+    end
+    else EffNP = -InitialInvestment;
+end
+else EffNP = NetProfit;
+
+// Position Sizing
+CapitalForNextTrade = InitialInvestment + EffNP;
+If CapitalForNextTrade < 0 then CapitalForNextTrade = 0;
+If Close > 0 then SharesToBuy = IntPortion(CapitalForNextTrade / Close)
+else SharesToBuy = 0;
+If SharesToBuy < 0 then SharesToBuy = 0;
+
+// ENTRY LOGIC
+If CurrentBar > MaxList(ATR_Period, MaxList(ATRBuy_Period, HMA_Slow_Length)) and
+   ATR_Value > 0 then begin
+
+    // === PRIMARY ENTRY: HMA CROSSOVER ===
+
+    // LONG ENTRY on Bull Cross
+    If EnableLongTrades and MarketPosition <= 0 and HMA_BullCross and SharesToBuy > 0 then begin
+        If MarketPosition = -1 then BuyToCover ("SX-Cross") Next Bar at Market;
+        Buy ("LE-HMA") SharesToBuy shares Next Bar at Market;
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value * ATR_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 - ATR_Stop_Distance;
+        FinalStop_Long = BasicStop;
+        TrailAmtPerShare = Close - BasicStop;
+        If TrailAmtPerShare > 0 then SetDollarTrailing(TrailAmtPerShare);
+        StoppedOutLong = false;
+        StoppedOutShort = false;
+
+        If PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " LONG ENTRY (HMA Cross) | Shares=", SharesToBuy);
+        end;
+    end;
+
+    // SHORT ENTRY on Bear Cross (uses scaled ATR for short exits)
+    If EnableShortTrades and MarketPosition >= 0 and HMA_BearCross and SharesToBuy > 0 then begin
+        If MarketPosition = 1 then Sell ("LX-Cross") Next Bar at Market;
+        SellShort ("SE-HMA") SharesToBuy shares Next Bar at Market;
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value_Short * ATR_Multiplier * Short_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 + ATR_Stop_Distance;
+        FinalStop_Short = BasicStop;
+        TrailAmtPerShare = BasicStop - Close;
+        If TrailAmtPerShare > 0 then SetDollarTrailing(TrailAmtPerShare);
+        StoppedOutLong = false;
+        StoppedOutShort = false;
+
+        If PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " SHORT ENTRY (HMA Cross) | Shares=", SharesToBuy);
+        end;
+    end;
+
+    // === RE-ENTRY: BUY-TOUCH AFTER STOP-OUT ===
+
+    // LONG RE-ENTRY (only if stopped out and HMA still bullish)
+    If EnableLongTrades and MarketPosition = 0 and StoppedOutLong and
+       HMA_BullTrend and BuyTouchLevel_Long > 0 and SharesToBuy > 0 then begin
+        Buy ("LE-ReEntry") SharesToBuy shares Next Bar at BuyTouchLevel_Long Stop;
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value * ATR_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 - ATR_Stop_Distance;
+        FinalStop_Long = BasicStop;
+        TrailAmtPerShare = Close - BasicStop;
+        If TrailAmtPerShare > 0 then SetDollarTrailing(TrailAmtPerShare);
+
+        If PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " LONG RE-ENTRY | TouchLevel=", BuyTouchLevel_Long:0:2);
+        end;
+    end;
+
+    // SHORT RE-ENTRY (only if stopped out and HMA still bearish, uses scaled ATR)
+    If EnableShortTrades and MarketPosition = 0 and StoppedOutShort and
+       HMA_BearTrend and BuyTouchLevel_Short > 0 and SharesToBuy > 0 then begin
+        SellShort ("SE-ReEntry") SharesToBuy shares Next Bar at BuyTouchLevel_Short Stop;
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value_Short * ATR_Multiplier * Short_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 + ATR_Stop_Distance;
+        FinalStop_Short = BasicStop;
+        TrailAmtPerShare = BasicStop - Close;
+        If TrailAmtPerShare > 0 then SetDollarTrailing(TrailAmtPerShare);
+
+        If PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " SHORT RE-ENTRY | TouchLevel=", BuyTouchLevel_Short:0:2);
+        end;
+    end;
+
+end;
+
+// LONG STOP MANAGEMENT
+If MarketPosition = 1 and ATR_Value > 0 then begin
+    // NO cap here - cap only applies at entry to limit initial risk
+    // Wide stops are allowed during position to avoid premature exits
+    BasicStop = HL2 - (ATR_Value * ATR_Multiplier);
+    If FinalStop_Long = 0 then FinalStop_Long = BasicStop
+    else If BasicStop > FinalStop_Long then FinalStop_Long = BasicStop;
+    StopDistance = Close - FinalStop_Long;
+    TrailAmtPerShare = StopDistance * BB_Multiplier;
+    If TrailAmtPerShare < 0 then Sell ("LX-StopBreach") Next Bar at Market
+    else SetDollarTrailing(TrailAmtPerShare);
+end
+else If MarketPosition <> 1 then FinalStop_Long = 0;
+
+// SHORT STOP MANAGEMENT (uses scaled ATR period and multiplier)
+If MarketPosition = -1 and ATR_Value_Short > 0 then begin
+    // NO cap here - cap only applies at entry to limit initial risk
+    // Wide stops are allowed during position to avoid premature exits
+    BasicStop = HL2 + (ATR_Value_Short * ATR_Multiplier * Short_Multiplier);
+    If FinalStop_Short = 0 then FinalStop_Short = BasicStop
+    else If BasicStop < FinalStop_Short then FinalStop_Short = BasicStop;
+    StopDistance = FinalStop_Short - Close;
+    TrailAmtPerShare = StopDistance * BB_Multiplier;
+    If TrailAmtPerShare < 0 then BuyToCover ("SX-StopBreach") Next Bar at Market
+    else SetDollarTrailing(TrailAmtPerShare);
+end
+else If MarketPosition <> -1 then FinalStop_Short = 0;
+
+PrevMarketPosition = MarketPosition;
+
+// Debug Output
+If PrintTesting then begin
+    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+    Print(printableDate, " HMA_Fast=", HMA_Fast:0:2, " HMA_Slow=", HMA_Slow:0:2,
+          " BullTrend=", HMA_BullTrend, " BearTrend=", HMA_BearTrend);
+    Print("  StoppedOutL=", StoppedOutLong, " StoppedOutS=", StoppedOutShort,
+          " ReEntryL=", BuyTouchLevel_Long:0:2, " ReEntryS=", BuyTouchLevel_Short:0:2);
+end;
+
+// End of optimization only - safe for live trading
+If LastBarOnChart and GetAppInfo(aiOptimizing) = 1 then begin
+    If MarketPosition = 1 then Sell ("LX-EndOfTest") this bar on Close;
+    If MarketPosition = -1 then BuyToCover ("SX-EndOfTest") this bar on Close;
+end;
+
+{-------------------------------------------------------------
+ CHANGE LOG
+--------------------------------------------------------------
+ v1.4 - 2025-12-15
+ - NEW: Short_Multiplier input for tighter short exits
+   * Scales both ATR_Period and ATR_Multiplier for short stops
+   * Range 0.2-1.0 (1.0 = same as longs, 0.2 = very tight)
+   * Separate ATR_Value_Short calculation with rounded period
+   * Tighter short exits reduce drawdown in bull markets
+
+ v1.4 - 2025-12-08
+ - Initial HMA-LS implementation with re-entry after stop-out
+--------------------------------------------------------------}

@@ -1,0 +1,12 @@
+ParameterName,Min,Max,Step
+ATR_Period,8,56,24
+ATR_Multiplier,2,20,2
+BB_Length,15,55,20
+BB_Deviation,1.5,3.5,2
+Vol_Threshold,0.06,0.30,0.12
+Min_Tightening,0.2,0.8,0.6
+Scaling_Method,0,2,2
+ATRBuy_Period,10,50,20
+ATRBuyMultiplier,0.5,3.5,1
+ATR_Smooth_Period,3,15,6
+EquityPrice_Method,0,1,1

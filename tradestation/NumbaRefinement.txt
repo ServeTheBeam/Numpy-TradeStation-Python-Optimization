@@ -1,0 +1,808 @@
+{
+NumbaRefinement TradingApp
+=========================
+Simplified Phase 5 refinement-only TradingApp for TS.
+Reads Numba-generated config + range files, runs exhaustive optimization
+with LIBB (1-minute resolution).
+
+Workflow:
+  1. User sets symbol, symbol2 (for DualS), in the UI
+  2. Clicks "Run Refinement"
+  3. App reads phase5_refine_config.csv from SymbolFolder
+  4. For each job: loads range CSV, runs exhaustive optimization
+  5. Exports Refinement_{strategy}_rank{N}_{SYMBOL}.csv
+
+Input files (Python -> TS):
+  phase5_refine_config.csv: JobNum,StrategyName,StrategyFile,RangeFile,Rank,ShortEnabled,IsDualSymbol
+  phase5_refine_{strategy}_rank{N}.csv: ParameterName,Min,Max,Step
+
+Output files (TS -> Python):
+  Refinement_{strategy}_rank{N}_{SYMBOL}.csv: Full metric export per test
+}
+
+using elsystem;
+using elsystem.collections;
+using elsystem.windows.forms;
+using elsystem.drawing;
+using elsystem.io;
+using tsopt;
+
+input:
+    BaseFolder("C:/Projects/numba-wfo/results/");
+
+vars:
+    // ---- State ----
+    string TargetSymbol(""),
+    string TargetSymbol2(""),
+    string SymbolFolder(""),
+    int CurrentJobIndex(0),
+    int TotalJobs(0),
+    bool IsRunning(false),
+    // OOS disabled - robustness done in Numba WFO
+
+    // ---- Refinement vectors ----
+    Vector RefineStrategyNames(null),
+    Vector RefineStrategyFiles(null),
+    Vector RefineRangeFiles(null),
+    Vector RefineRanks(null),
+    Vector RefineShortFlags(null),
+    Vector RefineDualFlags(null),
+
+    // ---- Current job params ----
+    Vector ParamNames(null),
+    Vector ParamMinValues(null),
+    Vector ParamMaxValues(null),
+    Vector ParamStepValues(null),
+
+    // ---- UI ----
+    Form mainForm(null),
+    Label lblStatus(null),
+    Label lblProgress(null),
+    TextBox txtSymbol(null),
+    TextBox txtSymbol2(null),
+    // TextBox txtOOSPct(null),  // OOS disabled - robustness done in Numba WFO
+    Button btnRefine(null),
+    Button btnAbort(null),
+
+    // ---- Hidden labels (state persistence across async callbacks) ----
+    Label hlJobIndex(null),
+    Label hlTotalJobs(null),
+    Label hlSymbolFolder(null),
+    Label hlSymbol(null),
+    Label hlSymbol2(null),
+    // Label hlOOSPct(null),  // OOS disabled
+
+    // ---- Optimizer ----
+    tsopt.Optimizer currentOptimizer(null);
+
+
+// ====================================================================
+// INITIALIZATION
+// ====================================================================
+
+method void InitApp()
+var:
+    int y,
+    Label l1,
+    Label l2,
+    Label l3;
+begin
+    // Create vectors
+    RefineStrategyNames = new Vector;
+    RefineStrategyFiles = new Vector;
+    RefineRangeFiles = new Vector;
+    RefineRanks = new Vector;
+    RefineShortFlags = new Vector;
+    RefineDualFlags = new Vector;
+    ParamNames = new Vector;
+    ParamMinValues = new Vector;
+    ParamMaxValues = new Vector;
+    ParamStepValues = new Vector;
+
+    // Build UI
+    mainForm = Form.Create("Numba WFO Refinement", 420, 300);
+
+    y = 15;
+
+    // Symbol
+    l1 = Label.Create("Symbol:", 65, 20);
+    l1.Location(15, y);
+    mainForm.AddControl(l1);
+    txtSymbol = TextBox.Create("", 100, 22);
+    txtSymbol.Location(85, y);
+    mainForm.AddControl(txtSymbol);
+
+    // Symbol2 (DualS)
+    l2 = Label.Create("Symbol2:", 55, 20);
+    l2.Location(200, y);
+    mainForm.AddControl(l2);
+    txtSymbol2 = TextBox.Create("", 100, 22);
+    txtSymbol2.Location(260, y);
+    mainForm.AddControl(txtSymbol2);
+
+    y += 45;
+
+    // Buttons
+    btnRefine = Button.Create("Run Refinement", 180, 35);
+    btnRefine.Location(15, y);
+    btnRefine.Click += OnRefineClick;
+    mainForm.AddControl(btnRefine);
+
+    btnAbort = Button.Create("ABORT", 100, 35);
+    btnAbort.Location(210, y);
+    btnAbort.Click += OnAbortClick;
+    mainForm.AddControl(btnAbort);
+
+    y += 50;
+
+    // Status labels
+    lblStatus = Label.Create("Ready. Set symbol and click Run Refinement.", 380, 20);
+    lblStatus.Location(15, y);
+    mainForm.AddControl(lblStatus);
+
+    y += 25;
+    lblProgress = Label.Create("", 380, 20);
+    lblProgress.Location(15, y);
+    mainForm.AddControl(lblProgress);
+
+    // Hidden labels for state persistence
+    hlJobIndex = Label.Create("0", 50, 20);
+    hlJobIndex.Visible = false;
+    mainForm.AddControl(hlJobIndex);
+
+    hlTotalJobs = Label.Create("0", 50, 20);
+    hlTotalJobs.Visible = false;
+    mainForm.AddControl(hlTotalJobs);
+
+    hlSymbolFolder = Label.Create("", 400, 20);
+    hlSymbolFolder.Visible = false;
+    mainForm.AddControl(hlSymbolFolder);
+
+    hlSymbol = Label.Create("", 100, 20);
+    hlSymbol.Visible = false;
+    mainForm.AddControl(hlSymbol);
+
+    hlSymbol2 = Label.Create("", 100, 20);
+    hlSymbol2.Visible = false;
+    mainForm.AddControl(hlSymbol2);
+
+    mainForm.Show();
+end;
+
+
+// ====================================================================
+// UI HELPERS
+// ====================================================================
+
+method void UpdateStatus(string msg)
+begin
+    lblStatus.Text = msg;
+end;
+
+method void UpdateProgress(string msg)
+begin
+    lblProgress.Text = msg;
+end;
+
+method void SetupSymbolFolder()
+begin
+    TargetSymbol = txtSymbol.Text;
+    TargetSymbol2 = txtSymbol2.Text;
+
+    if TargetSymbol2 <> "" then
+        SymbolFolder = BaseFolder + TargetSymbol + "_" + TargetSymbol2 + "/"
+    else
+        SymbolFolder = BaseFolder + TargetSymbol + "/";
+
+    // Persist
+    hlSymbol.Text = TargetSymbol;
+    hlSymbol2.Text = TargetSymbol2;
+    hlSymbolFolder.Text = SymbolFolder;
+end;
+
+
+// ====================================================================
+// CSV HELPERS (EasyLanguage has no string[] type)
+// ====================================================================
+
+method int CountCSVFields(string line)
+var:
+    int cnt,
+    int pos;
+begin
+    if line = "" then return 0;
+    cnt = 1;
+    for pos = 1 to StrLen(line)
+    begin
+        if MidStr(line, pos, 1) = "," then
+            cnt += 1;
+    end;
+    return cnt;
+end;
+
+method string GetCSVField(string line, int fieldIndex)
+var:
+    int currentField,
+    int startPos,
+    int pos,
+    string ch;
+begin
+    // fieldIndex is 0-based
+    currentField = 0;
+    startPos = 1;
+    for pos = 1 to StrLen(line)
+    begin
+        ch = MidStr(line, pos, 1);
+        if ch = "," then begin
+            if currentField = fieldIndex then
+                return MidStr(line, startPos, pos - startPos);
+            currentField += 1;
+            startPos = pos + 1;
+        end;
+    end;
+    // Last field (no trailing comma)
+    if currentField = fieldIndex then
+        return MidStr(line, startPos, StrLen(line) - startPos + 1);
+    return "";
+end;
+
+
+// ====================================================================
+// CONFIG & RANGE FILE LOADING
+// ====================================================================
+
+method bool LoadRefineConfig()
+var:
+    string configPath,
+    StreamReader reader,
+    string line,
+    int lineNum,
+    int numFields;
+begin
+    configPath = SymbolFolder + "phase5_refine_config.csv";
+
+    try
+        reader = StreamReader.Create(configPath);
+    catch (elsystem.Exception ex)
+        UpdateStatus("ERROR: " + configPath + " not found!");
+        return false;
+    end;
+
+    RefineStrategyNames.Clear();
+    RefineStrategyFiles.Clear();
+    RefineRangeFiles.Clear();
+    RefineRanks.Clear();
+    RefineShortFlags.Clear();
+    RefineDualFlags.Clear();
+
+    lineNum = 0;
+
+    while reader.EndOfStream = false
+    begin
+        line = reader.ReadLine();
+        lineNum += 1;
+
+        // Skip header
+        if lineNum = 1 then continue;
+        if line = "" then continue;
+
+        numFields = CountCSVFields(line);
+        if numFields >= 7 then begin
+            // JobNum,StrategyName,StrategyFile,RangeFile,Rank,ShortEnabled,IsDualSymbol
+            RefineStrategyNames.push_back(GetCSVField(line, 1));
+            RefineStrategyFiles.push_back(GetCSVField(line, 2));
+            RefineRangeFiles.push_back(GetCSVField(line, 3));
+            RefineRanks.push_back(GetCSVField(line, 4));
+            RefineShortFlags.push_back(GetCSVField(line, 5));
+            RefineDualFlags.push_back(GetCSVField(line, 6));
+        end;
+    end;
+
+    reader.Close();
+    TotalJobs = RefineStrategyNames.Count;
+    hlTotalJobs.Text = NumToStr(TotalJobs, 0);
+
+    UpdateStatus("Loaded " + NumToStr(TotalJobs, 0) + " refinement jobs from config.");
+    return true;
+end;
+
+
+method bool LoadRefineRanges(string rangeFile)
+var:
+    string rangePath,
+    StreamReader reader,
+    string line,
+    int lineNum,
+    int numFields;
+begin
+    rangePath = SymbolFolder + rangeFile;
+
+    try
+        reader = StreamReader.Create(rangePath);
+    catch (elsystem.Exception ex)
+        UpdateStatus("ERROR: Range file not found: " + rangePath);
+        return false;
+    end;
+
+    ParamNames.Clear();
+    ParamMinValues.Clear();
+    ParamMaxValues.Clear();
+    ParamStepValues.Clear();
+
+    lineNum = 0;
+
+    while reader.EndOfStream = false
+    begin
+        line = reader.ReadLine();
+        lineNum += 1;
+
+        if lineNum = 1 then continue;
+        if line = "" then continue;
+
+        numFields = CountCSVFields(line);
+        if numFields >= 4 then begin
+            ParamNames.push_back(GetCSVField(line, 0));
+            ParamMinValues.push_back(GetCSVField(line, 1));
+            ParamMaxValues.push_back(GetCSVField(line, 2));
+            ParamStepValues.push_back(GetCSVField(line, 3));
+        end;
+    end;
+
+    reader.Close();
+    return true;
+end;
+
+
+// ====================================================================
+// CHECK FOR EXISTING OUTPUT (RESUME SUPPORT)
+// ====================================================================
+
+method bool DoesRefineOutputExist(string stratName, string rankStr)
+var:
+    string path1,
+    string path2,
+    StreamReader testReader;
+begin
+    // New naming: Refinement_{strategy}_rank{N}_{SYMBOL}.csv
+    path1 = SymbolFolder + "Refinement_" + stratName + "_rank" + rankStr + "_" + TargetSymbol + ".csv";
+    // Also check with underscore symbol2
+    if TargetSymbol2 <> "" then
+        path2 = SymbolFolder + "Refinement_" + stratName + "_rank" + rankStr + "_" + TargetSymbol + "_" + TargetSymbol2 + ".csv"
+    else
+        path2 = path1;
+
+    // Check path1
+    try
+        testReader = StreamReader.Create(path1);
+        if testReader <> null then begin
+            testReader.Close();
+            return true;
+        end;
+    catch (elsystem.Exception ex)
+    end;
+
+    // Check path2 if different
+    if path2 <> path1 then begin
+        try
+            testReader = StreamReader.Create(path2);
+            if testReader <> null then begin
+                testReader.Close();
+                return true;
+            end;
+        catch (elsystem.Exception ex)
+        end;
+    end;
+
+    return false;
+end;
+
+
+// ====================================================================
+// REFINEMENT WORKFLOW
+// ====================================================================
+
+method void OnRefineClick(Object sender, EventArgs args)
+begin
+    if IsRunning then begin
+        UpdateStatus("Already running! Click ABORT first.");
+        return;
+    end;
+
+    SetupSymbolFolder();
+
+    if LoadRefineConfig() = false then return;
+
+    CurrentJobIndex = 0;
+    hlJobIndex.Text = "0";
+    IsRunning = true;
+
+    RunNextRefineJob();
+end;
+
+
+method void OnAbortClick(Object sender, EventArgs args)
+begin
+    if currentOptimizer <> null then begin
+        currentOptimizer.CancelJob();
+        currentOptimizer = null;
+    end;
+    IsRunning = false;
+    UpdateStatus("ABORTED by user.");
+end;
+
+
+method void RunNextRefineJob()
+var:
+    string stratName,
+    string stratFile,
+    string rangeFile,
+    string rankStr,
+    string shortFlag,
+    string dualFlag,
+    int jobIdx;
+begin
+    // Restore state from hidden labels
+    jobIdx = StrToNum(hlJobIndex.Text) astype int;
+    TotalJobs = StrToNum(hlTotalJobs.Text) astype int;
+    SymbolFolder = hlSymbolFolder.Text;
+    TargetSymbol = hlSymbol.Text;
+    TargetSymbol2 = hlSymbol2.Text;
+    // Reload config if vectors lost
+    if RefineStrategyNames = null or RefineStrategyNames.Count = 0 then begin
+        if LoadRefineConfig() = false then begin
+            IsRunning = false;
+            return;
+        end;
+    end;
+
+    if jobIdx >= TotalJobs then begin
+        OnRefineComplete();
+        return;
+    end;
+
+    stratName = RefineStrategyNames[jobIdx] astype string;
+    stratFile = RefineStrategyFiles[jobIdx] astype string;
+    rangeFile = RefineRangeFiles[jobIdx] astype string;
+    rankStr = RefineRanks[jobIdx] astype string;
+    shortFlag = RefineShortFlags[jobIdx] astype string;
+    dualFlag = RefineDualFlags[jobIdx] astype string;
+
+    // Resume: skip if output exists
+    if DoesRefineOutputExist(stratName, rankStr) then begin
+        UpdateStatus("Skipping " + stratName + " rank " + rankStr + " (output exists)");
+        hlJobIndex.Text = NumToStr(jobIdx + 1, 0);
+        RunNextRefineJob();
+        return;
+    end;
+
+    // Load ranges
+    if LoadRefineRanges(rangeFile) = false then begin
+        hlJobIndex.Text = NumToStr(jobIdx + 1, 0);
+        RunNextRefineJob();
+        return;
+    end;
+
+    UpdateStatus("Job " + NumToStr(jobIdx + 1, 0) + "/" + NumToStr(TotalJobs, 0)
+                 + ": " + stratName + " rank " + rankStr);
+
+    CreateRefineJob(stratFile, shortFlag, dualFlag);
+end;
+
+
+method void CreateRefineJob(string stratFile, string shortFlag, string dualFlag)
+var:
+    tsopt.Job job,
+    tsopt.Security security,
+    tsopt.Strategy strategy,
+    int i,
+    double paramMin,
+    double paramMax,
+    double paramStep,
+    string paramName,
+    int isDual,
+    int todayYear,
+    int todayMonth,
+    int todayDay,
+    int startYear;
+begin
+    isDual = StrToNum(dualFlag) astype int;
+
+    // Clean up previous optimizer
+    if currentOptimizer <> null then
+        currentOptimizer = null;
+
+    currentOptimizer = new tsopt.Optimizer;
+    currentOptimizer.JobDone += OnRefineDone;
+    currentOptimizer.JobFailed += OnRefineFailed;
+    currentOptimizer.ProgressChanged += OnRefineProgress;
+
+    job = new tsopt.Job;
+
+    // Calculate explicit 10-year date range (matches old working optimizer)
+    todayYear = Year(CurrentDate);
+    if todayYear < 1900 then
+        todayYear = todayYear + 1900;
+    todayMonth = Month(CurrentDate);
+    todayDay = DayOfMonth(CurrentDate);
+    startYear = todayYear - 10;
+
+    // Add Data1
+    security = job.Securities.AddSecurity();
+    security.Symbol = TargetSymbol;
+    security.Interval.SetDailyChart();
+    security.History.SetFirstDate(startYear, todayMonth, todayDay);
+    security.History.SetLastDate(todayYear, todayMonth, todayDay);
+
+    // Add Data2 for dual-symbol strategies
+    if isDual = 1 and TargetSymbol2 <> "" then begin
+        security = job.Securities.AddSecurity();
+        security.Symbol = TargetSymbol2;
+        security.Interval.SetDailyChart();
+        security.History.SetFirstDate(startYear, todayMonth, todayDay);
+        security.History.SetLastDate(todayYear, todayMonth, todayDay);
+    end;
+
+    // Add strategy
+    strategy = job.Strategies.AddStrategy(stratFile);
+
+    // Set EnableShortTrades — only for -LS strategies that have this input
+    // L-only strategies don't have it; non-EMA DualS uses Entry_Mode instead
+    if InStr(stratFile, "-LS") > 0 then begin
+        if InStr(stratFile, "DualS") > 0 then begin
+            // Non-EMA DualS strategies don't have EnableShortTrades - skip
+        end
+        else begin
+            if shortFlag = "0" then
+                strategy.ELInputs.SetInput("EnableShortTrades", "false")
+            else
+                strategy.ELInputs.SetInput("EnableShortTrades", "true");
+        end;
+    end;
+
+    // Set parameter ranges for optimization
+    for i = 0 to ParamNames.Count - 1
+    begin
+        paramName = ParamNames[i] astype string;
+        paramMin = StrToNum(ParamMinValues[i] astype string);
+        paramMax = StrToNum(ParamMaxValues[i] astype string);
+        paramStep = StrToNum(ParamStepValues[i] astype string);
+
+        if paramMin = paramMax then begin
+            // Fixed value - no optimization
+            strategy.ELInputs.SetInput(paramName, NumToStr(paramMin, 6));
+        end else begin
+            // Optimize this parameter
+            strategy.ELInputs.OptRange(paramName, paramMin, paramMax, paramStep);
+        end;
+    end;
+
+    // Exhaustive optimization
+    job.OptimizationMethod = tsopt.OptimizationMethod.Exhaustive;
+
+    // Results settings
+    job.Settings.ResultOptions.NumTestsToKeep = 100000;
+    job.Settings.ResultOptions.FitnessMetric = tsopt.MetricID.NetProfit;
+
+    // General settings - match old working optimizer
+    job.Settings.GeneralOptions.MaxBarsBack = 120;
+
+    // LIBB: Look Inside Bar at 1-minute resolution
+    job.Settings.GeneralOptions.LookInsideBarEnabled = true;
+    job.Settings.GeneralOptions.LookInsideBarResUnit = tsopt.Compression.Minute;
+    job.Settings.GeneralOptions.LookInsideBarResQty = 1;
+
+    // No OOS split - robustness already validated in Numba WFO phases
+
+    // Costs - minimal settings (matches old working optimizer)
+    job.Settings.CostsAndCapital.CommissionMode = tsopt.CommissionMode.Percent;
+    job.Settings.CostsAndCapital.CommissionPercent = 0.2;
+
+    currentOptimizer.StartJob(job);
+end;
+
+
+// ====================================================================
+// OPTIMIZER CALLBACKS
+// ====================================================================
+
+method void OnRefineProgress(elsystem.Object sender, tsopt.ProgressChangedEventArgs args)
+var:
+    int jobIdx,
+    int total,
+    int currentTest,
+    int totalTests,
+    double pctComplete;
+begin
+    jobIdx = StrToNum(hlJobIndex.Text) astype int;
+    total = StrToNum(hlTotalJobs.Text) astype int;
+    currentTest = args.Progress.TestNum;
+    totalTests = args.Progress.TestCount;
+
+    if totalTests > 0 then begin
+        pctComplete = (currentTest * 100.0) / totalTests;
+        UpdateProgress("Job " + NumToStr(jobIdx + 1, 0) + "/" + NumToStr(total, 0)
+                       + " | Test " + NumToStr(currentTest, 0) + "/" + NumToStr(totalTests, 0)
+                       + " (" + NumToStr(pctComplete, 1) + "%)");
+    end;
+end;
+
+
+method void OnRefineDone(elsystem.Object sender, tsopt.JobDoneEventArgs args)
+var:
+    int jobIdx,
+    string stratName,
+    string rankStr,
+    string shortFlag;
+begin
+    // Read current job info from hidden labels
+    jobIdx = StrToNum(hlJobIndex.Text) astype int;
+    TotalJobs = StrToNum(hlTotalJobs.Text) astype int;
+
+    // Reload vectors if lost across async callback
+    if RefineStrategyNames = null or RefineStrategyNames.Count = 0 then begin
+        LoadRefineConfig();
+    end;
+
+    if jobIdx < TotalJobs then begin
+        stratName = RefineStrategyNames[jobIdx] astype string;
+        rankStr = RefineRanks[jobIdx] astype string;
+        shortFlag = RefineShortFlags[jobIdx] astype string;
+
+        SaveRefineResults(args.Results, stratName, rankStr, shortFlag);
+        UpdateStatus("Completed: " + stratName + " rank " + rankStr
+                     + " (" + NumToStr(args.Results.TestCount, 0) + " results)");
+    end;
+
+    // Move to next job
+    hlJobIndex.Text = NumToStr(jobIdx + 1, 0);
+    RunNextRefineJob();
+end;
+
+
+method void OnRefineFailed(elsystem.Object sender, tsopt.JobFailedEventArgs args)
+var:
+    int jobIdx;
+begin
+    jobIdx = StrToNum(hlJobIndex.Text) astype int;
+    TotalJobs = StrToNum(hlTotalJobs.Text) astype int;
+    UpdateStatus("FAILED job " + NumToStr(jobIdx + 1, 0) + ": " + args.Error.Message);
+
+    // Skip to next
+    hlJobIndex.Text = NumToStr(jobIdx + 1, 0);
+
+    if jobIdx + 1 >= TotalJobs then begin
+        OnRefineComplete();
+        return;
+    end;
+
+    RunNextRefineJob();
+end;
+
+
+method void OnRefineComplete()
+begin
+    IsRunning = false;
+    UpdateStatus("All refinement jobs complete!");
+    UpdateProgress("");
+end;
+
+
+// ====================================================================
+// SAVE RESULTS
+// ====================================================================
+
+method void SaveRefineResults(tsopt.Results results, string stratName, string rankStr, string shortFlag)
+var:
+    string outPath,
+    StreamWriter writer,
+    string headerLine,
+    string dataLine,
+    string paramHeading,
+    double metricVal,
+    int testNum,
+    int paramIdx,
+    int metricIdx,
+    int colonPos,
+    bool isLSStrategy;
+begin
+    outPath = hlSymbolFolder.Text + "Refinement_" + stratName + "_rank" + rankStr
+              + "_" + hlSymbol.Text + ".csv";
+
+    if results.TestCount = 0 then return;
+
+    isLSStrategy = shortFlag = "1";
+
+    writer = StreamWriter.Create(outPath);
+    if writer = null then begin
+        UpdateStatus("ERROR: Cannot create file: " + outPath);
+        return;
+    end;
+
+    // Build header - parameter names first
+    headerLine = "";
+    for paramIdx = 0 to results.OptParamCount - 1
+    begin
+        if paramIdx > 0 then
+            headerLine = headerLine + ",";
+        paramHeading = results.GetOptParamHeading(paramIdx);
+        colonPos = paramHeading.IndexOf(":");
+        if colonPos >= 0 then
+            paramHeading = paramHeading.SubString(colonPos + 2, paramHeading.Length - colonPos - 2);
+        headerLine = headerLine + paramHeading;
+    end;
+
+    // Add test number column
+    headerLine = headerLine + ",TestNum";
+
+    // Add ALL metric headings (AllTrades)
+    for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+    begin
+        headerLine = headerLine + "," + tsopt.Results.GetMetricHeading(metricIdx, tsopt.TradeType.AllTrades);
+    end;
+
+    // For LS strategies, add Long and Short trade breakdowns
+    if isLSStrategy then begin
+        for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+        begin
+            headerLine = headerLine + "," + tsopt.Results.GetMetricHeading(metricIdx, tsopt.TradeType.LongTrades);
+        end;
+        for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+        begin
+            headerLine = headerLine + "," + tsopt.Results.GetMetricHeading(metricIdx, tsopt.TradeType.ShortTrades);
+        end;
+    end;
+
+    writer.WriteLine(headerLine);
+
+    // Write data rows
+    for testNum = 0 to results.TestCount - 1
+    begin
+        // Parameter values
+        dataLine = "";
+        for paramIdx = 0 to results.OptParamCount - 1
+        begin
+            if paramIdx > 0 then
+                dataLine = dataLine + ",";
+            dataLine = dataLine + results.GetOptValueString(paramIdx, testNum);
+        end;
+
+        // Test number
+        dataLine = dataLine + "," + NumToStr(results.GetTestNum(testNum), 0);
+
+        // All metrics (AllTrades)
+        for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+        begin
+            metricVal = results.GetMetric(metricIdx, testNum, tsopt.TradeType.AllTrades, tsopt.ResultsRange.All);
+            dataLine = dataLine + "," + NumToStr(metricVal, 7);
+        end;
+
+        // Long/Short breakdowns
+        if isLSStrategy then begin
+            for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+            begin
+                metricVal = results.GetMetric(metricIdx, testNum, tsopt.TradeType.LongTrades, tsopt.ResultsRange.All);
+                dataLine = dataLine + "," + NumToStr(metricVal, 7);
+            end;
+            for metricIdx = 0 to tsopt.MetricID.MetricCount - 1
+            begin
+                metricVal = results.GetMetric(metricIdx, testNum, tsopt.TradeType.ShortTrades, tsopt.ResultsRange.All);
+                dataLine = dataLine + "," + NumToStr(metricVal, 7);
+            end;
+        end;
+
+        writer.WriteLine(dataLine);
+    end;
+
+    writer.Close();
+    UpdateProgress("Saved " + NumToStr(results.TestCount, 0) + " results to " + outPath);
+end;
+
+
+// ====================================================================
+// ENTRY POINT
+// ====================================================================
+
+once
+begin
+    InitApp();
+end;

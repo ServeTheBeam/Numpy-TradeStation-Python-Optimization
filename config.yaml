@@ -1,0 +1,64 @@
+# Numba-WFO Configuration
+# -----------------------
+
+symbol: SMH
+data_dir: data/parquet
+results_dir: results
+
+# Data files: {data_dir}/{symbol}_1day.parquet, {data_dir}/{symbol}_1min.parquet
+# Results: {results_dir}/{symbol}/
+
+# Strategy selection
+strategy: atr_d_l          # atr_d_l, atr_d_ls, atr_d_hma_l, atr_d_hma_ls, atr_d_duals_l, atr_d_duals_ls
+grid: phase1_slim           # Grid name from grids/ module
+
+# WFO settings
+wfo:
+  warmup_bars: 100
+  initial_capital: 10000.0
+  cost_per_trade: 0.0356    # Round-trip cost per share
+  min_phases: 3              # Minimum phases a combo must pass
+  chunk_size: 10000000       # Combos per parallel chunk
+
+  # Phase definitions: (years_back_start, years_back_end, oos_fraction)
+  phases:
+    - [10, 5, 0.40]   # Phase 1
+    - [8,  3, 0.40]   # Phase 2
+    - [6,  1, 0.40]   # Phase 3
+    - [4,  0, 0.38]   # Phase 4
+
+# Scoring thresholds
+scoring:
+  wfe_dollar_min: 0.35      # OOS$/IS$ must exceed this
+  min_dd_threshold: 2000.0   # Only apply DD filters above this
+
+# Plateau detection
+plateaus:
+  min_cell_count: 50         # Minimum stable combos per (mult, buy_mult) cell
+  dbscan_eps: [0.5, 0.8, 1.0, 1.5, 2.0]
+  dbscan_min_samples: [2, 3, 5]
+  max_noise_pct: 60.0
+
+# Range generation (for TS refinement)
+ranges:
+  default_range_dir: strategies/ranges
+  expansion_factor: 0.5      # Expand T1 params by ±0.5 coarse steps
+
+# Data download (TradeStation API)
+tradestation:
+  client_id: "7lnjcSVFbEQ3QmeaeHVlY09IMBdACd2A"
+  client_secret: "cIZ2cLgj0JbWaWZwOj3O0mzwSxaxno7_k9S0l-d7sP0zlETpUI_GBrKOZoSEKt1v"
+  redirect_uri: "http://localhost:8080"
+  scopes: "openid offline_access profile MarketData"
+  api_base: "https://api.tradestation.com/v3"
+  token_file: "data/tokens/ts_token.json"
+
+storage:
+  parquet_dir: "data/parquet"
+  compression: "snappy"
+
+# TradeStation refinement settings
+ts_refinement:
+  oos_pct: 0                 # Disabled - robustness done in Numba WFO phases
+  max_bars_back: 70
+  results_to_keep: 100000

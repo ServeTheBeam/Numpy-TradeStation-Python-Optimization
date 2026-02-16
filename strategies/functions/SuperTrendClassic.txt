@@ -1,0 +1,66 @@
+inputs:
+    ATRLength(NumericSimple),
+    ATRMultiplier(NumericSimple),
+    STrend(NumericRef);
+
+variables:
+    ATRValue(0),
+    BasicUpperBand(0),
+    BasicLowerBand(0),
+    FinalUpperBand(0),
+    FinalLowerBand(0),
+    ST(0),
+    Trend(1); // 1 = bullish, -1 = bearish
+
+ATRValue = AvgTrueRange(ATRLength);
+
+// Calculate basic bands
+BasicUpperBand = (High + Low) / 2 + ATRMultiplier * ATRValue;
+BasicLowerBand = (High + Low) / 2 - ATRMultiplier * ATRValue;
+
+// Calculate final upper band
+if CurrentBar = 1 then
+    FinalUpperBand = BasicUpperBand
+else if (BasicUpperBand < FinalUpperBand[1]) or (Close[1] > FinalUpperBand[1]) then
+    FinalUpperBand = BasicUpperBand
+else
+    FinalUpperBand = FinalUpperBand[1];
+
+// Calculate final lower band
+if CurrentBar = 1 then
+    FinalLowerBand = BasicLowerBand
+else if (BasicLowerBand > FinalLowerBand[1]) or (Close[1] < FinalLowerBand[1]) then
+    FinalLowerBand = BasicLowerBand
+else
+    FinalLowerBand = FinalLowerBand[1];
+
+// Determine Trend
+if CurrentBar = 1 then
+    Trend = 1  // start with bullish assumption
+else begin
+    if Trend[1] = 1 then begin      // If previously bullish
+        if Close <= FinalLowerBand then
+            Trend = -1              // Flip to bearish
+        else
+            Trend = 1;              // Stay bullish
+    end
+    else begin                      // If previously bearish
+        if Close >= FinalUpperBand then
+            Trend = 1               // Flip to bullish
+        else
+            Trend = -1;             // Stay bearish
+    end;
+end;
+
+// Set SuperTrend value based on trend
+if Trend = 1 then
+    ST = FinalLowerBand
+else
+    ST = FinalUpperBand;
+
+SuperTrendClassic = ST;
+STrend = Trend;
+
+// Optional: Alert on Trend Change
+if Trend <> Trend[1] then
+    Alert("SuperTrend has changed direction.");

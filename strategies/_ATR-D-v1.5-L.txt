@@ -1,0 +1,649 @@
+{-------------------------------------------------------------
+ Strategy: Buy & Hold with ATR Trailing Stop and Floating Entry
+ Version: 1.5 (Cap-on-Entry + Entry Ratchet)
+ Date: 2026-01-08
+ Platform: TradeStation EasyLanguage
+ Timeframe: Daily bars
+
+ Description: LONG-ONLY buy-and-hold strategy with intelligent
+              trailing stop management and floating entry level.
+              Uses ATR-based trailing stops with Bollinger Band
+              volatility tightening. Entry via floating buy-if-touched
+              level with EMA smoothed ATR buffer.
+
+ Key Features:
+ - LONG ONLY (no short positions)
+ - ATR trailing stop (server-side via SetDollarTrailing)
+ - BB tightening: Contracts stop during low volatility
+ - Multiple scaling methods: Linear, Square Root, Exponential
+ - Floating Entry: BuyTouchLevel = Close + (ATR_EMA × Multiplier)
+ - EMA smoothing reduces ATR whipsaws while staying responsive
+ - Entry level recalculated every bar when flat
+
+ Entry Signals:
+ - Long: Buy-If-Touched above floating level
+ - BuyTouchLevel = Close + (ATR_EMA × ATRBuyMultiplier)
+ - Entry_Ratchet=0 (default): Recalculates every bar (floats with price)
+ - Entry_Ratchet=1: Only lowers entry, never raises (catches slow upward drifts)
+ - Independent ATR period and smoothing for entry
+ - EMA smoothing (default 5 bars) filters noise while maintaining responsiveness
+
+ Exit Signals:
+ - ATR trailing stop hit (tightened by BB when volatility contracts)
+ - NO OTHER EXIT CONDITIONS (always in market or waiting for re-entry)
+
+ Position Sizing:
+ - P/L reinvestment based on cumulative performance
+--------------------------------------------------------------}
+
+Inputs:
+	Name("Your strategy name")	  [DisplayName = "Displays in Strategy Name Column for ID"],
+    InitialInvestment(10000)      [DisplayName = "Initial Capital ($)"],
+    RunLive(false)                [DisplayName = "Run Live Mode (Baseline P/L)"],
+
+    // ATR Trailing Stop Parameters
+    ATR_Period(14)                [DisplayName = "[4-70][1] ATR Period (Stop Loss)"],
+    ATR_Multiplier(2.0)           [DisplayName = "[1-30][.25] ATR Multiplier (Stop Distance)"],
+
+    // Bollinger Band Tightening Parameters
+    BB_Length(20)                 [DisplayName = "[6-70][2] BB Length (Volatility)"],
+    BB_Deviation(2.0)             [DisplayName = "[1-4][.25] BB Std Deviations"],
+    Vol_Threshold(0.10)           [DisplayName = "[.02-.4][.02] BB Width Threshold (Tightening)"],
+    Min_Tightening(0.10)          [DisplayName = "[.1-.95][.05] Min Tightening Multiplier"],
+
+    // Scaling Method for BB Tightening
+    Scaling_Method(0)             [DisplayName = "[0-2][1] BB Scaling Method (0=Lin,1=Sqrt,2=Exp)"],
+
+    // Re-Entry Parameters (Floating with EMA Smoothed ATR)
+    ATRBuy_Period(14)             [DisplayName = "[4-70][1] ATR Period (Entry)"],
+    ATRBuyMultiplier(2.0)         [DisplayName = "[.5-20][.25] ATR Multiplier (Entry Buffer)"],
+    ATR_Smooth_Period(5)          [DisplayName = "[1-20][1] ATR EMA Smoothing Period"],
+    // Entry_Ratchet hardcoded to 0 (Float mode) - removed from optimization grid
+    // Analysis showed Entry_Ratchet=0 consistently outperformed in all v1.5 optimizations
+    // while doubling grid size (100% increase). Keeping code for manual testing if needed.
+    Entry_Ratchet(0)              [DisplayName = "Entry Ratchet (HARDCODED=0, not optimized)"],
+
+    // Price Selection for Calculations
+    EquityPrice_Method(0)         [DisplayName = "[0-1][1] Price Method (0=TypicalPrice,1=Close)"],
+
+    PrintTesting(false)           [DisplayName = "Enable Debug Output"];
+
+Variables:
+    // Price Calculation
+    CurrentPrice(0),
+    HL2(0),
+
+    // ATR and Stop Management
+    ATR_Value(0),
+    BasicStop(0),
+    FinalStop_Long(0),
+    StopDistance(0),
+    TrailAmtPerShare(0),
+
+    // Bollinger Band Volatility
+    BB_Width(0),
+    BB_Multiplier(1.0),
+
+    // Opening Stop Protection (4x 70-day ATR cap)
+    ATR_Baseline(0),
+    MaxStopDistance(0),
+    ATR_Stop_Distance(0),
+
+    // Re-Entry with EMA Smoothed ATR
+    ATRBuy_Value(0),
+    double ATR_Entry_Smooth(0),
+    BuyTouchLevel(0),
+    NewBuyTouchLevel(0),
+
+    // P/L Reinvestment Variables
+    EffNP(0),
+    BaseNP(0),
+    BaseTT(0),
+    bool BaselineSet(false),
+    bool InRealTime(false),
+    CapitalForNextTrade(0),
+    SharesToBuy(0),
+
+    // Tracking
+    PrevMarketPosition(0),
+
+    // Debug
+    string printableDate(""),
+    string ScalingMethodName(""),
+    string PriceMethodName("");
+
+// CRITICAL: Tell TradeStation trail amount is per SHARE, not total position
+once SetStopShare;
+
+// -------------------------------------------------------------
+// Initialize
+// -------------------------------------------------------------
+If CurrentBar = 1 then begin
+    If Scaling_Method = 0 then
+        ScalingMethodName = "Linear"
+    else If Scaling_Method = 1 then
+        ScalingMethodName = "SquareRoot"
+    else If Scaling_Method = 2 then
+        ScalingMethodName = "Exponential"
+    else
+        ScalingMethodName = "Unknown";
+
+    If EquityPrice_Method = 0 then
+        PriceMethodName = "TypicalPrice"
+    else
+        PriceMethodName = "Close";
+
+    if PrintTesting then
+        Print("Price Method: ", PriceMethodName, " | BB Scaling: ", ScalingMethodName);
+end;
+
+// -------------------------------------------------------------
+// Set Current Price based on method
+// -------------------------------------------------------------
+If EquityPrice_Method = 0 then
+    CurrentPrice = TypicalPrice
+else
+    CurrentPrice = Close;
+
+// Calculate HL2 for base stop (like SuperTrend)
+HL2 = (High + Low) / 2;
+
+// -------------------------------------------------------------
+// Calculate ATR for Stop Loss
+// -------------------------------------------------------------
+If CurrentBar > ATR_Period then
+    ATR_Value = AvgTrueRange(ATR_Period)
+else
+    ATR_Value = 0;
+
+// -------------------------------------------------------------
+// Calculate ATR Baseline for Opening Stop Protection
+// Cap at 4x 70-day ATR to limit opening risk during volatility spikes
+// This protection fades as trailing stop tightens via BB
+// -------------------------------------------------------------
+If CurrentBar > 70 then begin
+    ATR_Baseline = AvgTrueRange(70);
+    MaxStopDistance = ATR_Baseline * 4;
+end
+else begin
+    ATR_Baseline = 0;
+    MaxStopDistance = 0;
+end;
+
+// -------------------------------------------------------------
+// Calculate Bollinger Band Width
+// -------------------------------------------------------------
+If CurrentBar > BB_Length then begin
+    // CRITICAL: BollingerBandWidth requires a price SERIES with historical data
+    // TypicalPrice is a function, not a series - use Close for both methods
+    // The BB calculation is for volatility measurement, not entry price
+    BB_Width = BollingerBandWidth(Close, BB_Length, BB_Deviation, -BB_Deviation);
+
+    if PrintTesting and CurrentBar = BB_Length + 1 then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " BB_Width FIRST CALC: ", BB_Width:0:4);
+        Print("  Using Close series, BB_Length=", BB_Length:0:0);
+        Print("  BB_Deviation=", BB_Deviation:0:2, " Close=", Close:0:2);
+    end;
+end
+else
+    BB_Width = 0;
+
+// -------------------------------------------------------------
+// Calculate ATR for Buy-If-Touched Re-Entry (independent period)
+// -------------------------------------------------------------
+If CurrentBar > ATRBuy_Period then
+    ATRBuy_Value = AvgTrueRange(ATRBuy_Period)
+else
+    ATRBuy_Value = 0;
+
+// -------------------------------------------------------------
+// Smooth ATR with EMA for Entry
+// -------------------------------------------------------------
+If ATRBuy_Value > 0 then
+    ATR_Entry_Smooth = XAverage(ATRBuy_Value, ATR_Smooth_Period)
+else
+    ATR_Entry_Smooth = 0;
+
+// -------------------------------------------------------------
+// Calculate Floating Buy-If-Touched Level (Original Formula + EMA)
+// Entry_Ratchet=0: Recalculates every bar (floats with price)
+// Entry_Ratchet=1: Only lowers entry level, never raises (catches slow drifts)
+// -------------------------------------------------------------
+If ATR_Entry_Smooth > 0 and MarketPosition = 0 then begin
+    NewBuyTouchLevel = Close + (ATR_Entry_Smooth * ATRBuyMultiplier);
+
+    If Entry_Ratchet = 0 then begin
+        // Floating mode: always use new calculated level
+        BuyTouchLevel = NewBuyTouchLevel;
+    end
+    else begin
+        // Ratchet mode: only lower, never raise
+        If BuyTouchLevel = 0 or NewBuyTouchLevel < BuyTouchLevel then
+            BuyTouchLevel = NewBuyTouchLevel;
+        // else keep existing (lower) BuyTouchLevel
+    end;
+
+    if PrintTesting then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " BuyTouch=", BuyTouchLevel:0:2,
+              " (Close=", Close:0:2, " + ATR_EMA=", ATR_Entry_Smooth:0:3,
+              " × ", ATRBuyMultiplier:0:2, ")",
+              " [Ratchet=", Entry_Ratchet, ", New=", NewBuyTouchLevel:0:2, "]");
+    end;
+end
+else If MarketPosition <> 0 then begin
+    BuyTouchLevel = 0;  // Reset when in position
+end;
+
+// -------------------------------------------------------------
+// Calculate BB Multiplier for Stop Tightening
+// Uses different scaling methods
+// -------------------------------------------------------------
+If BB_Width >= Vol_Threshold then begin
+    // Normal volatility: No tightening
+    BB_Multiplier = 1.0;
+end
+else begin
+    // Low volatility: Apply tightening based on scaling method
+
+    // METHOD 0: LINEAR SCALING (Original)
+    // Multiplier = BBWidth / Threshold
+    // Example: BBWidth=0.05, Threshold=0.10 → Multiplier=0.50 (50% tightening)
+    If Scaling_Method = 0 then begin
+        BB_Multiplier = BB_Width / Vol_Threshold;
+    end;
+
+    // METHOD 1: SQUARE ROOT SCALING (Gentler)
+    // Multiplier = sqrt(BBWidth / Threshold)
+    // Example: BBWidth=0.05, Threshold=0.10 → Multiplier=0.707 (29% tightening)
+    // Rationale: Less aggressive than linear, smoother transition
+    If Scaling_Method = 1 then begin
+        BB_Multiplier = SquareRoot(BB_Width / Vol_Threshold);
+    end;
+
+    // METHOD 2: EXPONENTIAL SCALING (More Aggressive)
+    // Multiplier = (BBWidth / Threshold)^2
+    // Example: BBWidth=0.05, Threshold=0.10 → Multiplier=0.25 (75% tightening)
+    // Rationale: Very tight stops during extreme low volatility
+    If Scaling_Method = 2 then begin
+        BB_Multiplier = Square(BB_Width / Vol_Threshold);
+    end;
+
+    // Apply minimum to prevent over-tightening
+    If BB_Multiplier < Min_Tightening then
+        BB_Multiplier = Min_Tightening;
+end;
+
+if PrintTesting and BB_Multiplier < 1.0 then begin
+    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+    Print(printableDate, " BB TIGHTENING (", ScalingMethodName, "): BBWidth=", BB_Width:0:4,
+          " Threshold=", Vol_Threshold:0:2, " Multiplier=", BB_Multiplier:0:3);
+end;
+
+// -------------------------------------------------------------
+// Baseline Logic (RunLive mode)
+// -------------------------------------------------------------
+InRealTime = (GetAppInfo(aiRealTimeCalc) = 1);
+
+If RunLive then begin
+    If InRealTime and not BaselineSet then begin
+        if PrintTesting then
+            Print("REALTIME BASELINE SET: NetProfit=", NetProfit, " TotalTrades=", TotalTrades);
+        BaseNP = NetProfit;
+        BaseTT = TotalTrades;
+        BaselineSet = true;
+    end;
+
+    If BaselineSet then begin
+        EffNP = NetProfit - BaseNP;
+        If TotalTrades <= BaseTT then
+            EffNP = 0;
+    end
+    else begin
+        EffNP = -InitialInvestment;
+    end;
+end
+else begin
+    EffNP = NetProfit;
+end;
+
+// -------------------------------------------------------------
+// Capital & Position Sizing
+// -------------------------------------------------------------
+CapitalForNextTrade = InitialInvestment + EffNP;
+
+If CapitalForNextTrade < 0 then
+    CapitalForNextTrade = 0;
+
+If Close > 0 then
+    SharesToBuy = IntPortion(CapitalForNextTrade / Close)
+else
+    SharesToBuy = 0;
+
+If SharesToBuy < 0 then
+    SharesToBuy = 0;
+
+// -------------------------------------------------------------
+// ENTRY LOGIC: Buy-If-Touched (LONG ONLY) - Original Floating
+// -------------------------------------------------------------
+If CurrentBar > MaxList(ATR_Period, ATRBuy_Period) and ATR_Value > 0 and ATRBuy_Value > 0 then begin
+
+    // LONG ENTRY: Buy-If-Touched (floating level)
+    If MarketPosition = 0 and BuyTouchLevel > 0 and SharesToBuy > 0 then begin
+        // Enter long at buy-if-touched level
+        Buy ("LE-BuyTouch") SharesToBuy shares Next Bar at BuyTouchLevel Stop;
+
+        // CRITICAL: Set initial stop for entry bar
+        // Apply opening stop protection: cap at 4x 70-day ATR
+        ATR_Stop_Distance = ATR_Value * ATR_Multiplier;
+        If MaxStopDistance > 0 and ATR_Stop_Distance > MaxStopDistance then
+            ATR_Stop_Distance = MaxStopDistance;
+        BasicStop = HL2 - ATR_Stop_Distance;
+        FinalStop_Long = BasicStop;
+        TrailAmtPerShare = Close - BasicStop;
+
+        If TrailAmtPerShare > 0 then
+            SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " LONG ENTRY | Buy-If-Touched | Shares=", SharesToBuy,
+                  " TouchLevel=", BuyTouchLevel:0:2);
+            Print(printableDate, " [ENTRY] InitialStop=", BasicStop:0:2,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+
+end;
+
+// -------------------------------------------------------------
+// STOP LOSS MANAGEMENT: ATR Trailing with BB Tightening
+// Uses SetDollarTrailing for server-side execution
+// -------------------------------------------------------------
+
+// LONG Position Stop
+If MarketPosition = 1 and ATR_Value > 0 then begin
+    // Step 1: Calculate BasicStop (like SuperTrend BasicLowerBand)
+    // This is recalculated fresh every bar
+    // NO cap here - cap only applies at entry to limit initial risk
+    // Wide stops are allowed during position to avoid premature exits
+    BasicStop = HL2 - (ATR_Value * ATR_Multiplier);
+
+    if PrintTesting then begin
+        printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+        Print(printableDate, " [LONG DEBUG] HL2=", HL2:0:2, " ATR=", ATR_Value:0:3,
+              " Multiplier=", ATR_Multiplier:0:2, " BasicStop=", BasicStop:0:2);
+    end;
+
+    // Step 2: Calculate FinalStop (like SuperTrend FinalLowerBand)
+    // Trail upward only - can never move down
+    If FinalStop_Long = 0 then begin
+        FinalStop_Long = BasicStop;
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] INITIALIZING FinalStop_Long=", FinalStop_Long:0:2);
+    end
+    else If BasicStop > FinalStop_Long then begin
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] TRAILING UP: Old=", FinalStop_Long:0:2,
+                  " New=", BasicStop:0:2, " Diff=", (BasicStop - FinalStop_Long):0:2);
+        FinalStop_Long = BasicStop;
+    end
+    else begin
+        if PrintTesting then
+            Print(printableDate, " [LONG DEBUG] HOLDING: FinalStop=", FinalStop_Long:0:2,
+                  " BasicStop=", BasicStop:0:2, " (not trailing)");
+        // FinalStop_Long stays at previous value
+    end;
+
+    // Step 3: Calculate distance from Close to FinalStop
+    StopDistance = Close - FinalStop_Long;
+
+    if PrintTesting then begin
+        Print(printableDate, " [LONG DEBUG] Close=", Close:0:2, " FinalStop=", FinalStop_Long:0:2,
+              " StopDistance=", StopDistance:0:2);
+        Print(printableDate, " [LONG DEBUG] BB_Width=", BB_Width:0:4, " Vol_Threshold=", Vol_Threshold:0:2,
+              " BB_Multiplier=", BB_Multiplier:0:3, " Min_Tightening=", Min_Tightening:0:2);
+    end;
+
+    // Step 4: Apply BB multiplier to the distance
+    // BB_Multiplier = 1.0 → full distance (stop at FinalStop level)
+    // BB_Multiplier < 1.0 → tightened (stop closer than FinalStop)
+    TrailAmtPerShare = StopDistance * BB_Multiplier;
+
+    if PrintTesting then begin
+        Print(printableDate, " [LONG DEBUG] FINAL: StopDistance=", StopDistance:0:2,
+              " × BB_Mult=", BB_Multiplier:0:3, " = TrailAmt=", TrailAmtPerShare:0:2);
+        Print(printableDate, " [LONG DEBUG] Effective Stop Price = ", (Close - TrailAmtPerShare):0:2);
+    end;
+
+    // CRITICAL: If < 0, price has already dropped below FinalStop - EXIT IMMEDIATELY
+    If TrailAmtPerShare < 0 then begin
+        Sell ("LX-StopBreach") Next Bar at Market;
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " ***** LONG STOP BREACHED! Close=", Close:0:2,
+                  " FinalStop=", FinalStop_Long:0:2, " EXITING AT MARKET *****");
+        end;
+    end
+    else begin
+        SetDollarTrailing(TrailAmtPerShare);
+
+        if PrintTesting then begin
+            printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+            Print(printableDate, " LONG STOP: Close=", Close:0:2, " FinalStop=", FinalStop_Long:0:2,
+                  " StopDistance=", StopDistance:0:2, " BBMult=", BB_Multiplier:0:3,
+                  " TrailAmt=", TrailAmtPerShare:0:2);
+        end;
+    end;
+end
+else If MarketPosition <> 1 then begin
+    // Reset when not in long position
+    FinalStop_Long = 0;
+end;
+
+// -------------------------------------------------------------
+// Debug Output
+// -------------------------------------------------------------
+if PrintTesting and mod(CurrentBar, 20) = 0 then begin
+    printableDate = FormatDate("ddd MMM dd yy", ElDateToDateTime(Date));
+    Print("========================================");
+    Print(printableDate, " BUY & HOLD STATUS (LONG ONLY)");
+    Print("ATR(", ATR_Period, ")=", ATR_Value:0:3, " Multiplier=", ATR_Multiplier:0:2);
+    Print("BB Width=", BB_Width:0:4, " Threshold=", Vol_Threshold:0:2);
+    Print("BB Multiplier=", BB_Multiplier:0:3, " (", ScalingMethodName, ")");
+    Print("BuyTouchLevel=", BuyTouchLevel:0:2);
+    Print("ATR_Raw=", ATRBuy_Value:0:3, " ATR_EMA=", ATR_Entry_Smooth:0:3);
+    Print("ATRBuyMultiplier=", ATRBuyMultiplier:0:2, " Smooth_Period=", ATR_Smooth_Period);
+    Print("MarketPosition=", MarketPosition, " Capital=", CapitalForNextTrade:0:2);
+    Print("========================================");
+end;
+
+// -------------------------------------------------------------
+// Update Previous Position for Next Bar
+// -------------------------------------------------------------
+PrevMarketPosition = MarketPosition;
+
+{-------------------------------------------------------------
+ IMPLEMENTATION NOTES
+--------------------------------------------------------------
+ This strategy implements a LONG-ONLY buy-and-hold approach
+ with intelligent trailing stop management and dynamic re-entry.
+
+ Key Features:
+
+ 1. ATR-Based Trailing Stop:
+    - Stop distance = ATR × Multiplier (default: 14-period ATR × 2.0)
+    - LONG: Stop below price by ATR distance
+    - Uses SetDollarTrailing for SERVER-SIDE execution
+    - Stop trails automatically as price moves favorably
+    - Entry bar protection: Initial stop set in entry block
+
+ 2. Bollinger Band Tightening:
+    - Measures volatility via BB Width
+    - When BBWidth < Threshold: Tighten stop
+    - When BBWidth >= Threshold: Normal stop (no tightening)
+    - Prevents large losses during low-volatility breakouts
+
+ 3. Three Scaling Methods:
+
+    LINEAR (Method 0):
+    - Multiplier = BBWidth / Threshold
+    - Simple proportional scaling
+    - Example: 50% of threshold → 50% tightening
+
+    SQUARE ROOT (Method 1):
+    - Multiplier = sqrt(BBWidth / Threshold)
+    - Gentler tightening curve
+    - Less aggressive than linear
+    - Example: 50% of threshold → 29% tightening
+
+    EXPONENTIAL (Method 2):
+    - Multiplier = (BBWidth / Threshold)²
+    - Aggressive tightening curve
+    - Very tight stops in extreme low volatility
+    - Example: 50% of threshold → 75% tightening
+
+    Comparison at 50% of threshold (BBWidth=0.05, Threshold=0.10):
+    - Linear: 0.50 multiplier (50% stop distance)
+    - Sqrt:   0.71 multiplier (71% stop distance)
+    - Exp:    0.25 multiplier (25% stop distance)
+
+ 4. Floating Entry with EMA Smoothed ATR:
+    - Entry level = Close + (ATR_EMA × ATRBuyMultiplier)
+    - Recalculated EVERY BAR when flat
+    - TWO-STAGE ATR PROCESSING:
+
+      A. Raw ATR Calculation:
+         - Independent ATR period for entry (ATRBuy_Period, default: 14)
+         - Separate from stop loss ATR (ATR_Period)
+         - Raw ATR = AvgTrueRange(ATRBuy_Period)
+
+      B. EMA Smoothing:
+         - ATR_Entry_Smooth = XAverage(ATRBuy_Value, ATR_Smooth_Period)
+         - Default: 5-bar EMA smoothing
+         - Reduces whipsaws from ATR volatility spikes
+         - Maintains responsiveness to trend changes
+         - Smoother entry level adjustments
+
+    - Level floats with price continuously (no floor)
+    - Enters on breakout above floating level (Buy-If-Touched order)
+    - Allows optimization of entry sensitivity vs stop sensitivity
+    - Default: Close + 2.0 × ATR_EMA
+    - No cooldown period (always ready to re-engage)
+    - Only way to re-enter after stop-out
+
+    Example Flow:
+    - Day 1: Close=$100, ATR_Raw=$2.50, ATR_EMA=$2.30 → BuyTouch=$104.60
+    - Day 2: Close=$102, ATR_Raw=$2.40, ATR_EMA=$2.32 → BuyTouch=$106.64
+    - Day 3: Close=$99, ATR_Raw=$2.60, ATR_EMA=$2.38 → BuyTouch=$103.76
+    - Day 4: Close=$101, ATR_Raw=$2.30, ATR_EMA=$2.36 → BuyTouch=$105.72
+
+    Benefits:
+    - Floats with price (follows market direction)
+    - EMA smoothing reduces ATR noise and whipsaws
+    - More stable entry levels (less erratic adjustments)
+    - Still responsive to sustained volatility changes
+    - Allows market momentum to develop before entry
+    - Natural filtering mechanism via smoothed ATR buffer
+
+ 5. SetDollarTrailing vs Strategy Stop:
+    - SetDollarTrailing = Server-side execution
+    - Executes even when strategy offline or market closed
+    - Updates every bar while in position
+    - Critical for overnight/weekend protection
+    - MUST call "once SetStopShare;" at top of strategy
+
+ Trading Logic:
+ - LONG ONLY (no short positions)
+ - Enter on buy-if-touched breakout above floating level
+ - Hold position with trailing stop
+ - Stop tightens during low volatility (BB contraction)
+ - Exit ONLY on stop hit (no other exit conditions)
+ - Always in market or waiting for breakout entry
+
+ Position Sizing:
+ - P/L reinvestment for compounding returns
+ - Recalculates shares on each entry
+
+ RunLive Mode:
+ - Baselines P/L at first real-time bar
+--------------------------------------------------------------}
+
+// -------------------------------------------------------------
+// Close any open position at END OF OPTIMIZATION ONLY
+// Safe for live trading and backtesting - only triggers during optimization
+// -------------------------------------------------------------
+If LastBarOnChart and GetAppInfo(aiOptimizing) = 1 then begin
+    // We're on the last bar AND we're in optimization mode
+    // This closes positions for accurate optimization P/L calculation
+
+    If MarketPosition = 1 then
+        Sell ("LX-EndOfTest") this bar on Close;
+    If MarketPosition = -1 then
+        BuyToCover ("SX-EndOfTest") this bar on Close;
+end;
+
+{-------------------------------------------------------------
+ CHANGE LOG
+--------------------------------------------------------------
+ v1.4 (Original Floating Entry with EMA Smoothed ATR) - 2025-11-21
+ - RESTORED: Original floating entry formula
+ - NEW: EMA smoothing for ATR component (reduces whipsaws)
+ - REMOVED: BB_Entry_Length and BB_Entry_Deviation inputs
+ - REMOVED: BB_Entry_Upper, BB_Entry_Lower, BB_Entry_Avg, BB_Entry_StdDev variables
+ - REMOVED: BB Breakout entry logic
+ - ADDED: ATRBuy_Period, ATRBuyMultiplier, ATR_Smooth_Period inputs
+ - ADDED: ATRBuy_Value, ATR_Entry_Smooth, BuyTouchLevel variables
+ - Entry formula: BuyTouchLevel = Close + (ATR_EMA × Multiplier)
+ - ATR_Entry_Smooth = XAverage(ATRBuy_Value, ATR_Smooth_Period)
+ - Default 5-bar EMA smoothing reduces ATR noise
+ - Level recalculated every bar when flat (floating behavior)
+ - More stable entry levels while maintaining responsiveness
+ - Buy-If-Touched order enters on breakout above floating level
+ - Maintains all stop loss and BB tightening functionality
+
+ v1.3 (BB Break out Entry) - 2025-11-21
+ - NEW: Bollinger Band Breakout Entry System
+ - REMOVED: Trailing floor + breathing ATR entry mechanism
+ - REMOVED: ATRBuy_Period and ATRBuyMultiplier inputs
+ - REMOVED: TrailingFloorPrice, BuyTouchLevel, ATRBuy_Value, JustWentFlat variables
+ - ADDED: BB_Entry_Length and BB_Entry_Deviation inputs
+ - ADDED: BB_Entry_Upper, BB_Entry_Lower, BB_Entry_Avg, BB_Entry_StdDev variables
+ - Entry signal: Close > BB_Entry_Upper (breakout confirmation)
+ - Enters at market (no buy-if-touched level)
+ - Independent BB parameters allow entry/stop optimization
+ - Simplified entry logic with dynamic BB-based filtering
+ - Maintains all stop loss and BB tightening functionality
+
+ v1.2 (TrailBuyBack) - 2025-11-21
+ - NEW: Trailing floor + breathing ATR entry mechanism
+ - TrailingFloorPrice tracks lowest close since exit
+ - Floor only moves DOWN (never chases price up)
+ - BuyTouchLevel = Floor + (ATR × Mult) recalculated every bar
+ - ATR component "breathes" with changing volatility
+ - Provides dynamic filtering while maintaining discipline
+ - Entry level responds to both price AND volatility changes
+ - Removed NewBuyLevel variable (no longer needed)
+
+ v1.1 (TrailBuyBack) - 2025-11-19
+ - FIXED: Buy-If-Touched re-entry level now properly trails
+ - BuyTouchLevel is FIXED when position exits (no longer recalculates every bar)
+ - Level only moves DOWN as price drops (never chases price up)
+ - Added JustWentFlat detection to set initial level
+ - Added NewBuyLevel variable for trailing comparison
+ - TRUE trailing behavior: More attractive entry as price falls
+ - Enhanced debug output showing trailing actions
+ - FIXED: Explicit boolean comparison for condition evaluation
+
+ v1.0 (TrailBuyBack) - 2025-11-17
+ - Initial implementation (long-only variant)
+ - ATR-based trailing stop with SetDollarTrailing
+ - BB tightening with 3 scaling methods (Linear/Sqrt/Exp)
+ - Buy-If-Touched re-entry (breakout style)
+ - LONG ONLY (no short positions)
+ - P/L reinvestment with RunLive mode support
+ - Entry bar protection with initial stop in entry block
+ - SetStopShare for per-share trailing amounts
+--------------------------------------------------------------}
