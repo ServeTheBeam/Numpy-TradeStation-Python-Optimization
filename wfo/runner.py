@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from grids.atr_d_l import count_combinations, decode_flat_indices  # noqa: used as default
-from wfo.phases import compute_wfo_windows
+from wfo.phases import compute_wfo_windows, generate_phase_defs
 from wfo.scoring import score_phases
 
 CHUNK_SIZE = 10_000_000
@@ -208,11 +208,12 @@ def run_wfo(
     warmup_bars: int = 100,
     top_n: int = 2_000_000,
     cost_per_trade: float = 0.0,
-    min_phases: int = 3,
+    min_phases: int | None = None,
     initial_capital: float = 10_000.0,
     highs2: np.ndarray | None = None,
     lows2: np.ndarray | None = None,
     closes2: np.ndarray | None = None,
+    phase_defs: list | None = None,
 ) -> pd.DataFrame:
     """Walk-Forward Optimization with IS/OOS split matching TS pipeline.
 
@@ -233,12 +234,20 @@ def run_wfo(
 
     _, run_chunk_wfo_fn = _get_kernel(strategy)
 
-    print(f"WFO IS/OOS: 4 phases, {total:,} combos each")
+    # Auto-generate phase definitions if not provided
+    if phase_defs is None:
+        phase_defs, auto_min_phases = generate_phase_defs(dates)
+        if min_phases is None:
+            min_phases = auto_min_phases
+    if min_phases is None:
+        min_phases = 3
+
+    windows = compute_wfo_windows(dates, warmup_bars, phase_defs)
+
+    print(f"WFO IS/OOS: {len(windows)} phases, {total:,} combos each")
     if dual:
         print(f"Dual-symbol mode: Data1 ({len(highs)} bars) + Data2 ({len(highs2)} bars)")
     print(f"Numba threads: {numba.config.NUMBA_NUM_THREADS}")
-
-    windows = compute_wfo_windows(dates, warmup_bars)
     for w in windows:
         print(f"  {w['label']}")
 
@@ -321,10 +330,11 @@ def run_wfo(
 
     # --- Score ---
     print("\nComputing WFE scores per phase...")
+    n_phases = len(windows)
     scoring_result = score_phases(
         phase_is_pnl, phase_oos_pnl, phase_oos_trades,
         phase_is_maxdd, phase_oos_maxdd,
-        total, min_phases, top_n,
+        total, min_phases, top_n, n_phases=n_phases,
     )
 
     # --- Build output DataFrame ---
@@ -336,7 +346,8 @@ def run_wfo(
     df = pd.DataFrame(params)
     df["Stability_Score"] = stability_scores[top_idx]
     df["Phases_In_Top"] = phases_valid[top_idx]
-    for pn in range(1, 5):
+    for w in windows:
+        pn = w["phase_num"]
         df[f"P{pn}_OOS_PnL"] = phase_oos_pnl[pn][top_idx]
         df[f"P{pn}_IS_PnL"] = phase_is_pnl[pn][top_idx]
         df[f"P{pn}_OOS_Rank"] = scoring_result["phase_oos_rank"][pn][top_idx]
@@ -345,7 +356,8 @@ def run_wfo(
 
     total_oos_pnl = np.zeros(len(top_idx), dtype=np.float64)
     total_oos_trades = np.zeros(len(top_idx), dtype=np.int64)
-    for pn in range(1, 5):
+    for w in windows:
+        pn = w["phase_num"]
         total_oos_pnl += phase_oos_pnl[pn][top_idx]
         total_oos_trades += phase_oos_trades[pn][top_idx]
     df["Total_OOS_PnL"] = total_oos_pnl
@@ -359,15 +371,38 @@ def rescore_from_cache(
     wfo_dir: str,
     min_phases: int = 3,
     top_n: int = 2_000_000,
+    n_phases: int | None = None,
 ) -> pd.DataFrame:
     """Re-score cached .npy WFO results with current scoring parameters.
 
     Useful for iterating on scoring without re-running the WFO grid.
+    Auto-detects n_phases from meta.json or phase directories if not specified.
     """
     param_names = list(grid.keys())
     param_arrays = [grid[k] for k in param_names]
     total = count_combinations(grid)
     print(f"Grid: {total:,} combos")
+
+    # Auto-detect n_phases (and min_phases) from meta.json or directory listing
+    if n_phases is None:
+        meta_path = os.path.join(wfo_dir, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            n_phases = meta.get("n_phases", 4)
+            min_phases = meta.get("min_phases", min_phases)
+            print(f"Auto-detected {n_phases} phases, "
+                  f"min_phases={min_phases} from meta.json")
+        else:
+            # Fallback: count phase directories
+            pn = 1
+            while os.path.isdir(os.path.join(wfo_dir, f"phase{pn}")):
+                pn += 1
+            n_phases = pn - 1
+            if n_phases == 0:
+                raise FileNotFoundError(
+                    f"No phase directories found in {wfo_dir}")
+            print(f"Auto-detected {n_phases} phases from directories")
 
     phase_is_pnl = {}
     phase_oos_pnl = {}
@@ -375,7 +410,7 @@ def rescore_from_cache(
     phase_is_maxdd = {}
     phase_oos_maxdd = {}
 
-    for pn in range(1, 5):
+    for pn in range(1, n_phases + 1):
         pdir = os.path.join(wfo_dir, f"phase{pn}")
         phase_is_pnl[pn] = np.load(os.path.join(pdir, "is_pnl.npy"))
         phase_oos_pnl[pn] = np.load(os.path.join(pdir, "oos_pnl.npy"))
@@ -386,7 +421,7 @@ def rescore_from_cache(
     scoring_result = score_phases(
         phase_is_pnl, phase_oos_pnl, phase_oos_trades,
         phase_is_maxdd, phase_oos_maxdd,
-        total, min_phases, top_n,
+        total, min_phases, top_n, n_phases=n_phases,
     )
 
     top_idx = scoring_result["stable_idx"]
@@ -397,7 +432,7 @@ def rescore_from_cache(
     df = pd.DataFrame(params)
     df["Stability_Score"] = stability_scores[top_idx]
     df["Phases_In_Top"] = phases_valid[top_idx]
-    for pn in range(1, 5):
+    for pn in range(1, n_phases + 1):
         df[f"P{pn}_OOS_PnL"] = phase_oos_pnl[pn][top_idx]
         df[f"P{pn}_IS_PnL"] = phase_is_pnl[pn][top_idx]
         df[f"P{pn}_OOS_Rank"] = scoring_result["phase_oos_rank"][pn][top_idx]
@@ -406,7 +441,7 @@ def rescore_from_cache(
 
     total_oos_pnl = np.zeros(len(top_idx), dtype=np.float64)
     total_oos_trades = np.zeros(len(top_idx), dtype=np.int64)
-    for pn in range(1, 5):
+    for pn in range(1, n_phases + 1):
         total_oos_pnl += phase_oos_pnl[pn][top_idx]
         total_oos_trades += phase_oos_trades[pn][top_idx]
     df["Total_OOS_PnL"] = total_oos_pnl

@@ -113,8 +113,9 @@ def main():
     parser.add_argument("--start", default=None, help="Data start date")
     parser.add_argument("--cost", type=float, default=0.0,
                         help="Round-trip cost per share")
-    parser.add_argument("--min-phases", type=int, default=3,
-                        help="Minimum valid phases for stability")
+    parser.add_argument("--min-phases", type=int, default=None,
+                        help="Minimum valid phases for stability "
+                             "(default: auto from data length)")
     parser.add_argument("--output", default=None, help="Output CSV path")
     parser.add_argument("--symbol2", default=None,
                         help="Secondary symbol for DualS strategies")
@@ -152,9 +153,21 @@ def main():
     grid_name = args.grid or cfg.get("grid", "phase1_slim")
     wfo_cfg = cfg.get("wfo", {})
     cost = args.cost if args.cost != 0.0 else wfo_cfg.get("cost_per_trade", 0.0)
-    min_phases = args.min_phases or wfo_cfg.get("min_phases", 3)
+    # min_phases: CLI flag wins, then config, then None (auto from data length)
+    min_phases = args.min_phases
+    if min_phases is None:
+        cfg_min = wfo_cfg.get("min_phases")
+        if cfg_min is not None:
+            min_phases = int(cfg_min)
     data_dir = cfg.get("data_dir", "data/parquet")
     results_dir = cfg.get("results_dir", "results")
+
+    # Phase definitions: explicit list from config, or None for auto-generation
+    phase_defs_cfg = wfo_cfg.get("phases")
+    if phase_defs_cfg and isinstance(phase_defs_cfg, list):
+        phase_defs = [tuple(p) for p in phase_defs_cfg]
+    else:
+        phase_defs = None  # triggers auto-generation in run_wfo()
 
     # Resolve symbol2 early so folder name matches TS convention (TQQQ_QQQ)
     symbol2 = None
@@ -230,7 +243,8 @@ def main():
         if args.rescore:
             from wfo.runner import rescore_from_cache
             print(f"\nRe-scoring cached results from {wfo_dir}")
-            results = rescore_from_cache(grid, wfo_dir, min_phases)
+            rescore_kwargs = {"min_phases": min_phases} if min_phases is not None else {}
+            results = rescore_from_cache(grid, wfo_dir, **rescore_kwargs)
         else:
             highs, lows, closes, dates = data1
 
@@ -248,16 +262,19 @@ def main():
                 cost_per_trade=cost,
                 min_phases=min_phases,
                 highs2=highs2, lows2=lows2, closes2=closes2,
+                phase_defs=phase_defs,
             )
 
         # Print top 30
         print(f"\nTop 30 by Stability Score ({variant}):")
+        # Detect phase columns dynamically from results
+        phase_pnl_cols = [c for c in results.columns
+                          if c.startswith("P") and c.endswith("_OOS_PnL")]
         display_cols = [
             "atr_period", "atr_multiplier", "bb_length",
             "atr_buy_period", "atr_buy_multiplier",
             "Stability_Score", "Phases_In_Top", "Total_OOS_Trades",
-            "P1_OOS_PnL", "P2_OOS_PnL", "P3_OOS_PnL", "P4_OOS_PnL",
-        ]
+        ] + phase_pnl_cols
         avail = [c for c in display_cols if c in results.columns]
         pd.set_option("display.max_columns", 20)
         pd.set_option("display.width", 200)
@@ -319,7 +336,7 @@ def run_plateaus(candidates, strategy, symbol, cfg, results_dir, min_phases):
     ts_strategy_name = STRATEGY_TS_MAP.get(strategy, strategy)
 
     df = candidates
-    if min_phases > 0 and "Phases_In_Top" in df.columns:
+    if min_phases and min_phases > 0 and "Phases_In_Top" in df.columns:
         df = df[df["Phases_In_Top"] >= min_phases]
         print(f"  After filtering >= {min_phases} phases: {len(df):,}")
 

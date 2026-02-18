@@ -22,7 +22,8 @@ def score_phases(phase_is_pnl: dict, phase_oos_pnl: dict,
                  phase_oos_trades: dict,
                  phase_is_maxdd: dict, phase_oos_maxdd: dict,
                  total: int, min_phases: int = 3,
-                 top_n: int = 2_000_000) -> dict:
+                 top_n: int = 2_000_000,
+                 n_phases: int = 4) -> dict:
     """Apply v4 quality filters and cross-phase stability scoring.
 
     Args:
@@ -47,7 +48,7 @@ def score_phases(phase_is_pnl: dict, phase_oos_pnl: dict,
     phase_oos_rank = {}
     phase_valid_mask = {}
 
-    for pn in range(1, 5):
+    for pn in range(1, n_phases + 1):
         is_pnl = phase_is_pnl[pn]
         oos_pnl = phase_oos_pnl[pn]
         is_maxdd_arr = phase_is_maxdd[pn]
@@ -96,14 +97,14 @@ def score_phases(phase_is_pnl: dict, phase_oos_pnl: dict,
     print(f"\nCross-phase stability (valid in {min_phases}+ phases)...")
 
     phases_valid = np.zeros(total, dtype=np.int64)
-    for pn in range(1, 5):
+    for pn in range(1, n_phases + 1):
         phases_valid += phase_valid_mask[pn].astype(np.int64)
 
     stable_mask = phases_valid >= min_phases
     n_stable = int(stable_mask.sum())
     print(f"  Stable combos: {n_stable:,} ({n_stable/total*100:.2f}%)")
 
-    for count in range(4, 0, -1):
+    for count in range(n_phases, 0, -1):
         n = int((phases_valid == count).sum())
         print(f"    In {count} phases: {n:,}")
 
@@ -119,7 +120,7 @@ def score_phases(phase_is_pnl: dict, phase_oos_pnl: dict,
 
     for idx in stable_idx:
         ranks = []
-        for pn in range(1, 5):
+        for pn in range(1, n_phases + 1):
             if phase_valid_mask[pn][idx]:
                 ranks.append(phase_oos_rank[pn][idx])
 

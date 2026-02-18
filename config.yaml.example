@@ -17,15 +17,16 @@ wfo:
   warmup_bars: 100
   initial_capital: 10000.0
   cost_per_trade: 0.0356    # Round-trip cost per share
-  min_phases: 3              # Minimum phases a combo must pass
+  min_phases: 3              # Minimum phases a combo must pass (or omit for auto)
   chunk_size: 10000000       # Combos per parallel chunk
 
-  # Phase definitions: (years_back_start, years_back_end, oos_fraction)
-  phases:
-    - [10, 5, 0.40]   # Phase 1
-    - [8,  3, 0.40]   # Phase 2
-    - [6,  1, 0.40]   # Phase 3
-    - [4,  0, 0.38]   # Phase 4
+  # Phase definitions: auto-generate based on data length (default),
+  # or explicit override:
+  # phases:
+  #   - [10, 5, 0.40]
+  #   - [8,  3, 0.40]
+  #   - [6,  1, 0.40]
+  #   - [4,  0, 0.38]
 
 # Scoring thresholds
 scoring:
