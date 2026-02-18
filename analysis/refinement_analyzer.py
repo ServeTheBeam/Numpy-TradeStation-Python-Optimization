@@ -166,6 +166,33 @@ def _compute_combo_metrics(row: pd.Series, param_cols: list[str],
     else:
         analysis["sortino_ratio"] = 0
 
+    # Risk-averse metrics
+    avg_winning = row.get("All: Avg Winning Trade", 0)
+    avg_trade = row.get("All: Avg Trade", 0)
+
+    # Tail Ratio: avg_winning / |avg_losing| — measures stop discipline
+    if avg_losing > 0:
+        analysis["tail_ratio"] = avg_winning / avg_losing
+    else:
+        analysis["tail_ratio"] = avg_winning if avg_winning > 0 else 0
+
+    # Expectancy Ratio: avg_trade / |avg_losing| — profit per unit of risk
+    if avg_losing > 0:
+        analysis["expectancy_ratio"] = avg_trade / avg_losing
+    else:
+        analysis["expectancy_ratio"] = avg_trade if avg_trade > 0 else 0
+
+    # Risk-Adjusted Expectancy: avg_trade / trade_std_dev (trade-level Sharpe)
+    win_pct = win_rate / 100
+    loss_pct = 1 - win_pct
+    trade_variance = (win_pct * (avg_winning - avg_trade) ** 2
+                      + loss_pct * (-avg_losing - avg_trade) ** 2)
+    trade_std_dev = np.sqrt(trade_variance) if trade_variance > 0 else 0
+    if trade_std_dev > 0:
+        analysis["risk_adj_expectancy"] = avg_trade / trade_std_dev
+    else:
+        analysis["risk_adj_expectancy"] = 0
+
     # Build complete parameter set (T1 optimized + T2/T3 fixed)
     combo_params = {col: row[col] for col in param_cols}
     complete_params = {}
@@ -292,6 +319,38 @@ def calculate_rank_sum(combos: list[dict]) -> list[dict]:
     return combos
 
 
+def calculate_risk_adjusted_rank_sum(combos: list[dict]) -> list[dict]:
+    """Calculate risk-averse rank-sum score. Lower = better.
+
+    Drops net_profit and profit_dd_ratio (both reward absolute return size).
+    Adds sortino_ratio, tail_ratio, risk_adj_expectancy (reward risk discipline).
+    """
+    metrics = [
+        ("sortino_ratio", False),
+        ("mar_ratio", False),
+        ("tail_ratio", False),
+        ("risk_adj_expectancy", False),
+        ("profit_factor", False),
+        ("robustness", False),
+    ]
+
+    for c in combos:
+        c.setdefault("risk_adj_ranks", {})
+        c["risk_adj_rank_sum"] = 0
+
+    for metric, lower_is_better in metrics:
+        sorted_combos = sorted(
+            combos,
+            key=lambda x: x.get(metric, 0) if not lower_is_better else -x.get(metric, 0),
+            reverse=True,
+        )
+        for rank, c in enumerate(sorted_combos, 1):
+            c["risk_adj_ranks"][metric] = rank
+            c["risk_adj_rank_sum"] += rank
+
+    return combos
+
+
 def generate_report(results: dict, symbol_folder: str,
                     top_n: int = 50) -> dict[str, list[dict]]:
     """Get top combos per strategy, rank within each, and save results.
@@ -303,6 +362,7 @@ def generate_report(results: dict, symbol_folder: str,
     # Rank within each strategy independently
     for strategy_name, combos in by_strategy.items():
         calculate_rank_sum(combos)
+        calculate_risk_adjusted_rank_sum(combos)
         combos.sort(key=lambda x: x["rank_sum"])
 
     # Print ranked summary for each strategy
@@ -347,6 +407,7 @@ def _save_metrics_csv(combos: list[dict], symbol_folder: str):
             "Strategy": c["strategy"],
             "Plateau_Rank": c["plateau_rank"],
             "Rank_Sum": c.get("rank_sum", 0),
+            "Risk_Adj_Rank_Sum": c.get("risk_adj_rank_sum", 0),
             "Net_Profit": c.get("net_profit", 0),
             "Max_Drawdown": c.get("max_drawdown", 0),
             "CAGR_Pct": c.get("cagr_pct", 0),
@@ -357,6 +418,9 @@ def _save_metrics_csv(combos: list[dict], symbol_folder: str):
             "Sharpe_Ratio": c.get("sharpe_ratio", 0),
             "Sortino_Ratio": c.get("sortino_ratio", 0),
             "Profit_Factor": c.get("profit_factor", 0),
+            "Tail_Ratio": c.get("tail_ratio", 0),
+            "Expectancy_Ratio": c.get("expectancy_ratio", 0),
+            "Risk_Adj_Expectancy": c.get("risk_adj_expectancy", 0),
             "Robustness_Pct": c.get("robustness", 0),
             "Rank_NetProfit": c.get("ranks", {}).get("net_profit", 0),
             "Rank_MAR": c.get("ranks", {}).get("mar_ratio", 0),
@@ -377,25 +441,34 @@ def _save_metrics_csv(combos: list[dict], symbol_folder: str):
 
 
 def _save_best_parameters(combos: list[dict], symbol_folder: str):
-    """Save the #1 ranked combo per strategy."""
+    """Save the #1 ranked combo per strategy (both return-focused and risk-averse)."""
     strategy_best = {}
+    strategy_risk_best = {}
     for c in combos:
         s = c["strategy"]
         if s not in strategy_best or c["rank_sum"] < strategy_best[s]["rank_sum"]:
             strategy_best[s] = c
+        ra = c.get("risk_adj_rank_sum", float("inf"))
+        if s not in strategy_risk_best or ra < strategy_risk_best[s].get("risk_adj_rank_sum", float("inf")):
+            strategy_risk_best[s] = c
 
     rows = []
     for strategy in sorted(strategy_best.keys()):
         c = strategy_best[strategy]
         row = {
             "Strategy": strategy,
+            "Type": "Return-Focused",
             "Best_Plateau_Rank": c["plateau_rank"],
             "Rank_Sum": c.get("rank_sum", 0),
+            "Risk_Adj_Rank_Sum": c.get("risk_adj_rank_sum", 0),
             "Net_Profit": c.get("net_profit", 0),
             "MAR_Ratio": c.get("mar_ratio", 0),
             "Profit_DD_Ratio": c.get("profit_dd_ratio", 0),
             "Sharpe_Ratio": c.get("sharpe_ratio", 0),
             "Profit_Factor": c.get("profit_factor", 0),
+            "Tail_Ratio": c.get("tail_ratio", 0),
+            "Expectancy_Ratio": c.get("expectancy_ratio", 0),
+            "Risk_Adj_Expectancy": c.get("risk_adj_expectancy", 0),
             "Robustness_Pct": c.get("robustness", 0),
             "Max_Drawdown": c.get("max_drawdown", 0),
             "Total_Trades": c.get("total_trades", 0),
@@ -405,7 +478,33 @@ def _save_best_parameters(combos: list[dict], symbol_folder: str):
             row[param] = value
         rows.append(row)
 
-    df = pd.DataFrame(rows).sort_values("Rank_Sum")
+        # Add risk-averse best if different from return-focused best
+        rc = strategy_risk_best[strategy]
+        if rc is not c:
+            rrow = {
+                "Strategy": strategy,
+                "Type": "Risk-Averse",
+                "Best_Plateau_Rank": rc["plateau_rank"],
+                "Rank_Sum": rc.get("rank_sum", 0),
+                "Risk_Adj_Rank_Sum": rc.get("risk_adj_rank_sum", 0),
+                "Net_Profit": rc.get("net_profit", 0),
+                "MAR_Ratio": rc.get("mar_ratio", 0),
+                "Profit_DD_Ratio": rc.get("profit_dd_ratio", 0),
+                "Sharpe_Ratio": rc.get("sharpe_ratio", 0),
+                "Profit_Factor": rc.get("profit_factor", 0),
+                "Tail_Ratio": rc.get("tail_ratio", 0),
+                "Expectancy_Ratio": rc.get("expectancy_ratio", 0),
+                "Risk_Adj_Expectancy": rc.get("risk_adj_expectancy", 0),
+                "Robustness_Pct": rc.get("robustness", 0),
+                "Max_Drawdown": rc.get("max_drawdown", 0),
+                "Total_Trades": rc.get("total_trades", 0),
+                "Win_Rate": rc.get("win_rate", 0),
+            }
+            for param, value in rc.get("all_params", {}).items():
+                rrow[param] = value
+            rows.append(rrow)
+
+    df = pd.DataFrame(rows).sort_values(["Strategy", "Type"])
     output_path = os.path.join(symbol_folder, "phase5_best_parameters.csv")
     df.to_csv(output_path, index=False)
     print(f"Best parameters saved to: {output_path}")
@@ -421,6 +520,8 @@ _YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00",
                            fill_type="solid")
 _LIGHT_BLUE_FILL = PatternFill(start_color="ADD8E6", end_color="ADD8E6",
                                fill_type="solid")
+_LIGHT_GREEN_FILL = PatternFill(start_color="90EE90", end_color="90EE90",
+                                fill_type="solid")
 _THIN_BORDER = Border(
     left=Side(style="thin"), right=Side(style="thin"),
     top=Side(style="thin"), bottom=Side(style="thin"),
@@ -428,13 +529,14 @@ _THIN_BORDER = Border(
 _IMPORTANT_COLS = {
     "Net_Profit", "Max_Drawdown", "CAGR_Pct", "MAR_Ratio",
     "Profit_DD_Ratio", "Sharpe_Ratio", "Profit_Factor",
-    "Robustness_Pct", "Rank_Sum",
+    "Robustness_Pct", "Rank_Sum", "Risk_Adj_Rank_Sum",
 }
 _CURRENCY_COLS = {"Net_Profit", "Max_Drawdown", "Avg_Trade"}
 _DECIMAL_COLS = {
     "CAGR_Pct", "MAR_Ratio", "Profit_DD_Ratio", "Sharpe_Ratio",
     "Sortino_Ratio", "Plateau_Sharpe", "Profit_Factor", "Win_Rate",
-    "Robustness_Pct",
+    "Robustness_Pct", "Tail_Ratio", "Expectancy_Ratio",
+    "Risk_Adj_Expectancy",
 }
 
 
@@ -442,13 +544,19 @@ def _combos_to_dataframe(combos: list[dict]) -> pd.DataFrame:
     """Convert combo dicts to a DataFrame for Excel writing."""
     rows = []
     best_rank_sum = min(c["rank_sum"] for c in combos) if combos else 0
+    best_risk_adj = min(c.get("risk_adj_rank_sum", float("inf"))
+                        for c in combos) if combos else 0
 
     for c in combos:
+        is_best = c["rank_sum"] == best_rank_sum
+        is_risk_best = c.get("risk_adj_rank_sum", float("inf")) == best_risk_adj
         row = {
             "Strategy": c["strategy"],
             "Plateau_Rank": c["plateau_rank"],
-            "Is_Best": c["rank_sum"] == best_rank_sum,
+            "Is_Best": is_best,
+            "Is_Risk_Best": is_risk_best and not is_best,
             "Rank_Sum": c.get("rank_sum", 0),
+            "Risk_Adj_Rank_Sum": c.get("risk_adj_rank_sum", 0),
             "Net_Profit": c.get("net_profit", 0),
             "Max_Drawdown": c.get("max_drawdown", 0),
             "CAGR_Pct": c.get("cagr_pct", 0),
@@ -458,6 +566,9 @@ def _combos_to_dataframe(combos: list[dict]) -> pd.DataFrame:
             "Sortino_Ratio": c.get("sortino_ratio", 0),
             "Plateau_Sharpe": c.get("plateau_sharpe", 0),
             "Profit_Factor": c.get("profit_factor", 0),
+            "Tail_Ratio": c.get("tail_ratio", 0),
+            "Expectancy_Ratio": c.get("expectancy_ratio", 0),
+            "Risk_Adj_Expectancy": c.get("risk_adj_expectancy", 0),
             "Win_Rate": c.get("win_rate", 0),
             "Robustness_Pct": c.get("robustness", 0),
             "Total_Trades": c.get("total_trades", 0),
@@ -478,7 +589,7 @@ def _combos_to_dataframe(combos: list[dict]) -> pd.DataFrame:
 
 def _write_sheet(ws, df: pd.DataFrame):
     """Write a DataFrame to an openpyxl worksheet with standard formatting."""
-    columns = [c for c in df.columns if c != "Is_Best"]
+    columns = [c for c in df.columns if c not in ("Is_Best", "Is_Risk_Best")]
 
     # Header row
     for col_idx, col_name in enumerate(columns, 1):
@@ -494,6 +605,7 @@ def _write_sheet(ws, df: pd.DataFrame):
     # Data rows
     for row_idx, (_, row_data) in enumerate(df.iterrows(), 2):
         is_best_row = row_data.get("Is_Best", False)
+        is_risk_best_row = row_data.get("Is_Risk_Best", False)
 
         for col_idx, col_name in enumerate(columns, 1):
             value = row_data[col_name]
@@ -517,6 +629,8 @@ def _write_sheet(ws, df: pd.DataFrame):
 
             if is_best_row:
                 cell.fill = _LIGHT_BLUE_FILL
+            elif is_risk_best_row:
+                cell.fill = _LIGHT_GREEN_FILL
             elif col_name in _IMPORTANT_COLS:
                 cell.fill = _YELLOW_FILL
 
@@ -538,14 +652,14 @@ def save_combined_excel(by_strategy: dict[str, list[dict]],
     """Save combined analysis to Excel with Overview + per-strategy sheets."""
     wb = Workbook()
 
-    # --- Overview sheet: best 5 combos from each strategy ---
+    # --- Overview sheet: best 20 combos from each strategy ---
     ws_overview = wb.active
     ws_overview.title = "Overview"
 
     overview_combos = []
     for strategy_name in sorted(by_strategy.keys()):
         combos = by_strategy[strategy_name]
-        overview_combos.extend(combos[:5])
+        overview_combos.extend(combos[:20])
 
     if overview_combos:
         overview_df = _combos_to_dataframe(overview_combos)
