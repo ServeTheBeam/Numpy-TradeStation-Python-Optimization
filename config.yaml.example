@@ -45,9 +45,10 @@ ranges:
   expansion_factor: 0.5      # Expand T1 params by ±0.5 coarse steps
 
 # Data download (TradeStation API)
+# Copy this file to config.yaml and fill in your credentials.
 tradestation:
-  client_id: "7lnjcSVFbEQ3QmeaeHVlY09IMBdACd2A"
-  client_secret: "cIZ2cLgj0JbWaWZwOj3O0mzwSxaxno7_k9S0l-d7sP0zlETpUI_GBrKOZoSEKt1v"
+  client_id: "YOUR_CLIENT_ID"
+  client_secret: "YOUR_CLIENT_SECRET"
   redirect_uri: "http://localhost:8080"
   scopes: "openid offline_access profile MarketData"
   api_base: "https://api.tradestation.com/v3"
