@@ -10,6 +10,7 @@ build/
 .eggs/
 *.parquet
 data/parquet/
+data/tokens/
 results/
 *.xlsx
 .venv/

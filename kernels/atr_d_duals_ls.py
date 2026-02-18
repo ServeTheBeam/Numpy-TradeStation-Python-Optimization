@@ -156,6 +156,24 @@ def run_strategy_wfo(
             continue
         eval_bar_count += 1
 
+        # -- Mark-to-market split at IS/OOS boundary --
+        if i == oos_start_bar and position != 0 and entry_bar < oos_start_bar:
+            split_price = closes1[i - 1]
+            if position == 1:
+                mtm_pnl = (split_price - entry_price) * shares
+            else:
+                mtm_pnl = (entry_price - split_price) * shares
+            is_pnl += mtm_pnl
+            is_trades += 1
+            equity += mtm_pnl
+            if equity > is_peak:
+                is_peak = equity
+            dd = is_peak - equity
+            if dd > is_maxdd:
+                is_maxdd = dd
+            entry_price = split_price
+            entry_bar = oos_start_bar
+
         if i >= oos_start_bar and not oos_peak_set:
             oos_peak = equity; oos_peak_set = True
 

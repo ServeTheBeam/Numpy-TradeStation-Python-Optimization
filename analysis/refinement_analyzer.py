@@ -9,7 +9,8 @@ the top 50 individual parameter combos (across all plateaus) using:
   - Profit/Drawdown ratio
   - Robustness (% profitable combinations in source plateau)
 
-Uses rank-sum composite scoring (lower = better).
+Uses rank-sum composite scoring (lower = better), computed per strategy
+to prevent a dominant strategy from pushing all others to bottom ranks.
 
 Usage:
     python -m analysis.refinement_analyzer --symbol SMH
@@ -219,6 +220,50 @@ def get_top_combos(results: dict, top_n: int = 50) -> list[dict]:
     return all_combos[:top_n]
 
 
+def get_top_combos_by_strategy(results: dict,
+                               top_n: int = 50) -> dict[str, list[dict]]:
+    """Get top N combos per strategy, keyed by strategy name.
+
+    Unlike get_top_combos() which pools everything, this ensures each strategy
+    gets its own top-N ranking so a dominant strategy can't crowd others out.
+    """
+    # Group results by strategy
+    by_strategy: dict[str, list[dict]] = {}
+
+    for key, data in sorted(results.items()):
+        strategy_name, rank = key
+        df = data["data"]
+        config_params = data.get("config_params") or {}
+        param_cols = _get_parameter_columns(df)
+
+        if "All: Net Profit" not in df.columns or len(df) == 0:
+            continue
+
+        profitable = df[df["All: Net Profit"] > 0]
+        robustness = len(profitable) / len(df) * 100
+
+        avg_profit = df["All: Net Profit"].mean()
+        std_profit = df["All: Net Profit"].std()
+        plateau_sharpe = avg_profit / std_profit if std_profit > 0 else 0
+
+        top_rows = df.nlargest(top_n, "All: Net Profit")
+
+        for _, row in top_rows.iterrows():
+            combo = _compute_combo_metrics(
+                row, param_cols, strategy_name, rank,
+                config_params, robustness, plateau_sharpe,
+            )
+            by_strategy.setdefault(strategy_name, []).append(combo)
+
+    # Sort and trim each strategy's combos
+    for strategy_name in by_strategy:
+        combos = by_strategy[strategy_name]
+        combos.sort(key=lambda x: x["net_profit"], reverse=True)
+        by_strategy[strategy_name] = combos[:top_n]
+
+    return by_strategy
+
+
 def calculate_rank_sum(combos: list[dict]) -> list[dict]:
     """Calculate multi-factor rank-sum score. Lower = better."""
     metrics = [
@@ -248,39 +293,50 @@ def calculate_rank_sum(combos: list[dict]) -> list[dict]:
 
 
 def generate_report(results: dict, symbol_folder: str,
-                    top_n: int = 50) -> list[dict]:
-    """Get top combos across all plateaus, rank, and save results."""
-    combos = get_top_combos(results, top_n)
-    combos = calculate_rank_sum(combos)
-    combos.sort(key=lambda x: x["rank_sum"])
+                    top_n: int = 50) -> dict[str, list[dict]]:
+    """Get top combos per strategy, rank within each, and save results.
 
-    # Print ranked summary
-    print(f"\n{'='*110}")
-    print(f"PHASE 5 REFINEMENT ANALYSIS — Top {len(combos)} Combos")
-    print(f"{'='*110}")
-    header = (f"{'#':<4} {'Strategy':<22} {'Plat':>4} {'Net Profit':>12} "
-              f"{'MAR':>6} {'P/DD':>6} {'Sharpe':>7} {'PF':>8} {'Rob%':>5} "
-              f"{'Trades':>6} {'Win%':>5} {'RankSum':>8}")
-    print(header)
-    print("-" * 110)
+    Returns dict[strategy_name, list[dict]] with rank_sum computed per strategy.
+    """
+    by_strategy = get_top_combos_by_strategy(results, top_n)
 
-    for i, c in enumerate(combos, 1):
-        print(f"{i:<4} {c['strategy']:<22} {c['plateau_rank']:>4} "
-              f"${c.get('net_profit', 0):>11,.0f} "
-              f"{c.get('mar_ratio', 0):>6.2f} "
-              f"{c.get('profit_dd_ratio', 0):>6.2f} "
-              f"{c.get('sharpe_ratio', 0):>7.2f} "
-              f"{c.get('profit_factor', 0):>8.2f} "
-              f"{c.get('robustness', 0):>5.1f} "
-              f"{c.get('total_trades', 0):>6.0f} "
-              f"{c.get('win_rate', 0):>5.1f} "
-              f"{c.get('rank_sum', 0):>8}")
+    # Rank within each strategy independently
+    for strategy_name, combos in by_strategy.items():
+        calculate_rank_sum(combos)
+        combos.sort(key=lambda x: x["rank_sum"])
+
+    # Print ranked summary for each strategy
+    for strategy_name, combos in sorted(by_strategy.items()):
+        print(f"\n{'='*110}")
+        print(f"PHASE 5 REFINEMENT ANALYSIS — {strategy_name} "
+              f"— Top {len(combos)} Combos")
+        print(f"{'='*110}")
+        header = (f"{'#':<4} {'Strategy':<22} {'Plat':>4} {'Net Profit':>12} "
+                  f"{'MAR':>6} {'P/DD':>6} {'Sharpe':>7} {'PF':>8} {'Rob%':>5} "
+                  f"{'Trades':>6} {'Win%':>5} {'RankSum':>8}")
+        print(header)
+        print("-" * 110)
+
+        for i, c in enumerate(combos, 1):
+            print(f"{i:<4} {c['strategy']:<22} {c['plateau_rank']:>4} "
+                  f"${c.get('net_profit', 0):>11,.0f} "
+                  f"{c.get('mar_ratio', 0):>6.2f} "
+                  f"{c.get('profit_dd_ratio', 0):>6.2f} "
+                  f"{c.get('sharpe_ratio', 0):>7.2f} "
+                  f"{c.get('profit_factor', 0):>8.2f} "
+                  f"{c.get('robustness', 0):>5.1f} "
+                  f"{c.get('total_trades', 0):>6.0f} "
+                  f"{c.get('win_rate', 0):>5.1f} "
+                  f"{c.get('rank_sum', 0):>8}")
 
     # Save outputs
-    _save_metrics_csv(combos, symbol_folder)
-    _save_best_parameters(combos, symbol_folder)
+    all_combos = []
+    for combos in by_strategy.values():
+        all_combos.extend(combos)
+    _save_metrics_csv(all_combos, symbol_folder)
+    _save_best_parameters(all_combos, symbol_folder)
 
-    return combos
+    return by_strategy
 
 
 def _save_metrics_csv(combos: list[dict], symbol_folder: str):
@@ -355,18 +411,43 @@ def _save_best_parameters(combos: list[dict], symbol_folder: str):
     print(f"Best parameters saved to: {output_path}")
 
 
-def save_combined_excel(combos: list[dict], symbol_folder: str, symbol: str):
-    """Save combined analysis to Excel with formatting and color coding."""
-    # Identify #1 combo (lowest rank_sum) for highlighting
+# ---------------------------------------------------------------------------
+# Excel styling constants
+# ---------------------------------------------------------------------------
+_HEADER_FONT = Font(bold=True)
+_HEADER_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9",
+                           fill_type="solid")
+_YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00",
+                           fill_type="solid")
+_LIGHT_BLUE_FILL = PatternFill(start_color="ADD8E6", end_color="ADD8E6",
+                               fill_type="solid")
+_THIN_BORDER = Border(
+    left=Side(style="thin"), right=Side(style="thin"),
+    top=Side(style="thin"), bottom=Side(style="thin"),
+)
+_IMPORTANT_COLS = {
+    "Net_Profit", "Max_Drawdown", "CAGR_Pct", "MAR_Ratio",
+    "Profit_DD_Ratio", "Sharpe_Ratio", "Profit_Factor",
+    "Robustness_Pct", "Rank_Sum",
+}
+_CURRENCY_COLS = {"Net_Profit", "Max_Drawdown", "Avg_Trade"}
+_DECIMAL_COLS = {
+    "CAGR_Pct", "MAR_Ratio", "Profit_DD_Ratio", "Sharpe_Ratio",
+    "Sortino_Ratio", "Plateau_Sharpe", "Profit_Factor", "Win_Rate",
+    "Robustness_Pct",
+}
+
+
+def _combos_to_dataframe(combos: list[dict]) -> pd.DataFrame:
+    """Convert combo dicts to a DataFrame for Excel writing."""
+    rows = []
     best_rank_sum = min(c["rank_sum"] for c in combos) if combos else 0
 
-    rows = []
     for c in combos:
-        is_best = c["rank_sum"] == best_rank_sum
         row = {
             "Strategy": c["strategy"],
             "Plateau_Rank": c["plateau_rank"],
-            "Is_Best": is_best,
+            "Is_Best": c["rank_sum"] == best_rank_sum,
             "Rank_Sum": c.get("rank_sum", 0),
             "Net_Profit": c.get("net_profit", 0),
             "Max_Drawdown": c.get("max_drawdown", 0),
@@ -392,45 +473,23 @@ def save_combined_excel(combos: list[dict], symbol_folder: str, symbol: str):
             row[f"Param_{param}"] = value
         rows.append(row)
 
-    df = pd.DataFrame(rows).sort_values("Rank_Sum")
+    return pd.DataFrame(rows).sort_values("Rank_Sum")
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Phase5 Analysis"
 
-    header_font = Font(bold=True)
-    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-    yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    light_blue_fill = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-
-    important_cols = {
-        "Net_Profit", "Max_Drawdown", "CAGR_Pct", "MAR_Ratio",
-        "Profit_DD_Ratio", "Sharpe_Ratio", "Profit_Factor", "Robustness_Pct", "Rank_Sum",
-    }
-    currency_cols = {
-        "Net_Profit", "Max_Drawdown", "Avg_Trade",
-    }
-    decimal_cols = {
-        "CAGR_Pct", "MAR_Ratio", "Profit_DD_Ratio", "Sharpe_Ratio", "Sortino_Ratio",
-        "Plateau_Sharpe", "Profit_Factor", "Win_Rate", "Robustness_Pct",
-    }
-
+def _write_sheet(ws, df: pd.DataFrame):
+    """Write a DataFrame to an openpyxl worksheet with standard formatting."""
     columns = [c for c in df.columns if c != "Is_Best"]
 
     # Header row
     for col_idx, col_name in enumerate(columns, 1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.font = header_font
-        cell.border = thin_border
+        cell.font = _HEADER_FONT
+        cell.border = _THIN_BORDER
         cell.alignment = Alignment(horizontal="center")
-        if col_name in important_cols:
-            cell.fill = yellow_fill
+        if col_name in _IMPORTANT_COLS:
+            cell.fill = _YELLOW_FILL
         else:
-            cell.fill = header_fill
+            cell.fill = _HEADER_FILL
 
     # Data rows
     for row_idx, (_, row_data) in enumerate(df.iterrows(), 2):
@@ -439,7 +498,7 @@ def save_combined_excel(combos: list[dict], symbol_folder: str, symbol: str):
         for col_idx, col_name in enumerate(columns, 1):
             value = row_data[col_name]
             cell = ws.cell(row=row_idx, column=col_idx)
-            cell.border = thin_border
+            cell.border = _THIN_BORDER
 
             if pd.isna(value) or (isinstance(value, float) and np.isinf(value)):
                 if col_name == "Profit_Factor":
@@ -449,17 +508,17 @@ def save_combined_excel(combos: list[dict], symbol_folder: str, symbol: str):
             else:
                 cell.value = value
 
-            if col_name in currency_cols:
+            if col_name in _CURRENCY_COLS:
                 cell.number_format = '"$"#,##0'
-            elif col_name in decimal_cols:
+            elif col_name in _DECIMAL_COLS:
                 cell.number_format = "0.00"
             elif col_name.startswith("Param_") and isinstance(value, float):
                 cell.number_format = "0.00"
 
             if is_best_row:
-                cell.fill = light_blue_fill
-            elif col_name in important_cols:
-                cell.fill = yellow_fill
+                cell.fill = _LIGHT_BLUE_FILL
+            elif col_name in _IMPORTANT_COLS:
+                cell.fill = _YELLOW_FILL
 
     # Auto-adjust column widths
     for col_idx, col_name in enumerate(columns, 1):
@@ -468,9 +527,41 @@ def save_combined_excel(combos: list[dict], symbol_folder: str, symbol: str):
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if cell_value:
                 max_length = max(max_length, len(str(cell_value)))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_length + 2, 20)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(
+            max_length + 2, 20)
 
     ws.freeze_panes = "A2"
+
+
+def save_combined_excel(by_strategy: dict[str, list[dict]],
+                        symbol_folder: str, symbol: str):
+    """Save combined analysis to Excel with Overview + per-strategy sheets."""
+    wb = Workbook()
+
+    # --- Overview sheet: best 5 combos from each strategy ---
+    ws_overview = wb.active
+    ws_overview.title = "Overview"
+
+    overview_combos = []
+    for strategy_name in sorted(by_strategy.keys()):
+        combos = by_strategy[strategy_name]
+        overview_combos.extend(combos[:5])
+
+    if overview_combos:
+        overview_df = _combos_to_dataframe(overview_combos)
+        _write_sheet(ws_overview, overview_df)
+
+    # --- Per-strategy sheets ---
+    for strategy_name in sorted(by_strategy.keys()):
+        combos = by_strategy[strategy_name]
+        if not combos:
+            continue
+
+        # Truncate sheet name to 31 chars (Excel limit)
+        sheet_name = strategy_name[:31]
+        ws = wb.create_sheet(title=sheet_name)
+        df = _combos_to_dataframe(combos)
+        _write_sheet(ws, df)
 
     output_path = os.path.join(symbol_folder, f"phase5_combined_{symbol}.xlsx")
     wb.save(output_path)
@@ -538,21 +629,15 @@ def main():
         show_plateau_details(results, args.details[0], int(args.details[1]))
         return
 
-    combos = generate_report(results, symbol_folder, args.top)
-    save_combined_excel(combos, symbol_folder, args.symbol)
+    by_strategy = generate_report(results, symbol_folder, args.top)
+    save_combined_excel(by_strategy, symbol_folder, args.symbol)
 
-    print(f"\nAnalysis complete. {len(combos)} combos ranked.")
-    print("Scoring Metrics Explanation:")
-    print("  MAR Ratio    = CAGR% / MaxDrawdown% (>0.5 good, >1.0 excellent)")
-    print("  Profit/DD    = Net Profit / Max Drawdown (higher = better)")
-    print("  Sharpe Ratio = Risk-adjusted return approximation (>1.0 good)")
-    print("  Sortino      = Like Sharpe but only penalizes downside (>1.0 good)")
-    print("  Profit Factor= Gross Profit / Gross Loss (>1.5 good, >2.0 excellent)")
-    print("  Robustness   = % profitable combos in source plateau (higher = more stable)")
-    print("Rank Sum = Sum of ranks across all 6 metrics (LOWER = BETTER)")
-    print("")
-    print("NOTE: All output files include complete parameter sets (T1+T2+T3)")
-    print("      ready to run live in TradeStation.")
+    total_combos = sum(len(combos) for combos in by_strategy.values())
+    print(f"\nAnalysis complete. {total_combos} combos ranked "
+          f"across {len(by_strategy)} strategies.")
+    print("Scoring: MAR>0.5 good, Sharpe>1.0 good, PF>1.5 good")
+    print("Rank Sum = sum of ranks across 6 metrics (LOWER = BETTER)")
+    print("NOTE: Rank sums are computed WITHIN each strategy (not cross-strategy)")
 
 
 if __name__ == "__main__":

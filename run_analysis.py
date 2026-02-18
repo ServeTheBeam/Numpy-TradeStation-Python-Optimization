@@ -4,6 +4,7 @@
 Usage:
     python run_analysis.py --symbol SMH
     python run_analysis.py --symbol SMH --top 10
+    python run_analysis.py --symbol TQQQ --symbol2 QQQ
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ def main():
     parser.add_argument("--symbol2", default=None,
                         help="Secondary symbol for DualS strategies")
     parser.add_argument("--top", type=int, default=25,
-                        help="Number of top results to show")
+                        help="Number of top results per strategy")
     parser.add_argument("--config", default="config.yaml",
                         help="Config file path")
     args = parser.parse_args()
@@ -50,12 +51,15 @@ def main():
         print("No refinement results found!")
         sys.exit(1)
 
-    analyses = generate_report(results, symbol_folder, args.top)
-    save_combined_excel(analyses, symbol_folder, symbol_key)
+    by_strategy = generate_report(results, symbol_folder, args.top)
+    save_combined_excel(by_strategy, symbol_folder, symbol_key)
 
-    print(f"\nAnalysis complete. {len(analyses)} plateaus analyzed.")
+    total_combos = sum(len(combos) for combos in by_strategy.values())
+    print(f"\nAnalysis complete. {total_combos} combos ranked "
+          f"across {len(by_strategy)} strategies.")
     print("Scoring: MAR>0.5 good, Sharpe>1.0 good, PF>1.5 good")
     print("Rank Sum = sum of ranks across 6 metrics (LOWER = BETTER)")
+    print("NOTE: Rank sums are computed WITHIN each strategy (not cross-strategy)")
 
 
 if __name__ == "__main__":
